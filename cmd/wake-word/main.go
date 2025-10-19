@@ -15,8 +15,6 @@ import (
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	
-	// Define command-line flags
-	vadEnabled := flag.Bool("vad", false, "Enable Voice Activity Detection (default: false)")
 	flag.Parse()
 
 	// Setup KWS (Keyword Spotting) configuration
@@ -49,81 +47,7 @@ func main() {
 	}
 	defer sherpa.DeleteKeywordSpotter(spotter)
 
-	var vad *sherpa.VoiceActivityDetector
-	var vadConfig sherpa.VadModelConfig
-	var windowSize int
-	var bufferSizeInSeconds float32 = 5
-	var buffer *sherpa.CircularBuffer
-
-	if *vadEnabled {
-		// Setup VAD (Voice Activity Detection) configuration
-		vadConfig = sherpa.VadModelConfig{}
-
-		// Try to use silero_vad.onnx first, then ten-vad.onnx
-		// First check in the models directory, then in the root directory
-		if FileExists("./models/silero_vad.onnx") {
-			fmt.Println("Using silero-vad model from models directory")
-			vadConfig.SileroVad.Model = "./models/silero_vad.onnx"
-			vadConfig.SileroVad.Threshold = 0.5
-			vadConfig.SileroVad.MinSilenceDuration = 0.5
-			vadConfig.SileroVad.MinSpeechDuration = 0.25
-			vadConfig.SileroVad.MaxSpeechDuration = 10
-			vadConfig.SileroVad.WindowSize = 512
-		} else if FileExists("./models/ten-vad.onnx") {
-			fmt.Println("Using ten-vad model from models directory")
-			vadConfig.TenVad.Model = "./models/ten-vad.onnx"
-			vadConfig.TenVad.Threshold = 0.5
-			vadConfig.TenVad.MinSilenceDuration = 0.5
-			vadConfig.TenVad.MinSpeechDuration = 0.25
-			vadConfig.TenVad.MaxSpeechDuration = 10
-			vadConfig.TenVad.WindowSize = 256
-		} else if FileExists("./silero_vad.onnx") {
-			fmt.Println("Using silero-vad model from root directory")
-			vadConfig.SileroVad.Model = "./silero_vad.onnx"
-			vadConfig.SileroVad.Threshold = 0.5
-			vadConfig.SileroVad.MinSilenceDuration = 0.5
-			vadConfig.SileroVad.MinSpeechDuration = 0.25
-			vadConfig.SileroVad.MaxSpeechDuration = 10
-			vadConfig.SileroVad.WindowSize = 512
-		} else if FileExists("./ten-vad.onnx") {
-			fmt.Println("Using ten-vad model from root directory")
-			vadConfig.TenVad.Model = "./ten-vad.onnx"
-			vadConfig.TenVad.Threshold = 0.5
-			vadConfig.TenVad.MinSilenceDuration = 0.5
-			vadConfig.TenVad.MinSpeechDuration = 0.25
-			vadConfig.TenVad.MaxSpeechDuration = 10
-			vadConfig.TenVad.WindowSize = 256
-		} else {
-			fmt.Println("Error: Please download either silero_vad.onnx or ten-vad.onnx to the models directory or root directory")
-			fmt.Println("You can download them from: https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/")
-			return
-		}
-
-		vadConfig.SampleRate = 16000
-		vadConfig.NumThreads = 1
-		vadConfig.Provider = "cpu"
-		vadConfig.Debug = 1
-
-		windowSize = int(vadConfig.SileroVad.WindowSize)
-		if vadConfig.TenVad.Model != "" {
-			windowSize = int(vadConfig.TenVad.WindowSize)
-		}
-
-		// Create VAD instance
-		vad = sherpa.NewVoiceActivityDetector(&vadConfig, bufferSizeInSeconds)
-		if vad == nil {
-			log.Fatal("Failed to create voice activity detector")
-		}
-		defer sherpa.DeleteVoiceActivityDetector(vad)
-
-		// Create circular buffer for audio samples
-		buffer = sherpa.NewCircularBuffer(10 * int(vadConfig.SampleRate))
-		if buffer == nil {
-			log.Fatal("Failed to create circular buffer")
-		}
-		defer sherpa.DeleteCircularBuffer(buffer)
-	}
-
+	
 	// Initialize audio context
 	ctx, err := malgo.InitContext(nil, malgo.ContextConfig{}, func(message string) {
 		fmt.Printf("Audio LOG <%v>\n", message)
@@ -154,89 +78,24 @@ func main() {
 
 	fmt.Println("Initializing audio device...")
 
-	// Track speech state (only used when VAD is enabled)
-	printed := false
-	speechDetected := false
-
 	onRecvFrames := func(_, pSample []byte, framecount uint32) {
 		samples := samplesInt16ToFloat(pSample)
-		
-		if *vadEnabled {
-			// VAD-enabled processing
-			if buffer != nil {
-				buffer.Push(samples)
-				
-				// Process audio in window chunks
-				for buffer.Size() >= windowSize {
-					head := buffer.Head()
-					s := buffer.Get(head, windowSize)
-					buffer.Pop(windowSize)
 
-					// Feed audio to VAD
-					vad.AcceptWaveform(s)
+		// Direct processing - feed all audio to the keyword spotter
+		stream.AcceptWaveform(16000, samples)
 
-					// Check if speech is detected
-					if vad.IsSpeech() && !printed {
-						printed = true
-						log.Print("Speech detected - starting keyword spotting")
-						speechDetected = true
-					}
+		// Process the keyword spotter in a loop to get all possible detections
+		for spotter.IsReady(stream) {
+			spotter.Decode(stream)
+			result := spotter.GetResult(stream)
 
-					if !vad.IsSpeech() {
-						printed = false
-						if speechDetected {
-							log.Print("Speech ended - resetting keyword spotter")
-							speechDetected = false
-							// Reset the keyword stream when speech ends to clear any partial detections
-							spotter.Reset(stream)
-						}
-					}
+			if result.Keyword != "" {
+				log.Printf("WAKE WORD DETECTED: %s", result.Keyword)
+				// Reset the stream after detecting a keyword to avoid repeated detections
+				spotter.Reset(stream)
 
-					// Process speech segments if detected
-					for !vad.IsEmpty() {
-						speechSegment := vad.Front()
-						vad.Pop()
-
-						duration := float32(len(speechSegment.Samples)) / float32(vadConfig.SampleRate)
-						log.Printf("Processing speech segment: %.2f seconds", duration)
-
-						// Feed the speech segment to the keyword spotter only when speech is detected
-						stream.AcceptWaveform(int(vadConfig.SampleRate), speechSegment.Samples)
-
-						// Process the keyword spotter in a loop to get all possible detections
-						for spotter.IsReady(stream) {
-							spotter.Decode(stream)
-							result := spotter.GetResult(stream)
-							
-							if result.Keyword != "" {
-								log.Printf("WAKE WORD DETECTED: %s", result.Keyword)
-								// Reset the stream after detecting a keyword to avoid repeated detections
-								spotter.Reset(stream)
-								
-								// Here you can trigger your wake word response logic
-								triggerWakeWordAction(result.Keyword)
-							}
-						}
-					}
-				}
-			}
-		} else {
-			// Direct processing without VAD - feed all audio to the keyword spotter
-			stream.AcceptWaveform(16000, samples)
-
-			// Process the keyword spotter in a loop to get all possible detections
-			for spotter.IsReady(stream) {
-				spotter.Decode(stream)
-				result := spotter.GetResult(stream)
-				
-				if result.Keyword != "" {
-					log.Printf("WAKE WORD DETECTED: %s", result.Keyword)
-					// Reset the stream after detecting a keyword to avoid repeated detections
-					spotter.Reset(stream)
-					
-					// Here you can trigger your wake word response logic
-					triggerWakeWordAction(result.Keyword)
-				}
+				// Here you can trigger your wake word response logic
+				triggerWakeWordAction(result.Keyword)
 			}
 		}
 	}
@@ -255,11 +114,7 @@ func main() {
 		log.Fatal("Failed to start audio device:", err)
 	}
 
-	if *vadEnabled {
-		fmt.Println("Wake word detection started with VAD enabled. Listening for '你好小智' or '小智同学'. Press Ctrl+C to exit.")
-	} else {
-		fmt.Println("Wake word detection started without VAD. Listening for '你好小智' or '小智同学'. Press Ctrl+C to exit.")
-	}
+	fmt.Println("Wake word detection started. Listening for '你好小智' or '小智同学'. Press Ctrl+C to exit.")
 	
 	// Wait for interrupt signal to stop
 	sigChan := make(chan os.Signal, 1)
