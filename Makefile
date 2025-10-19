@@ -23,7 +23,7 @@ all: build
 # 显示帮助信息
 .PHONY: help
 help:
-	@echo "小知WebSocket客户端 构建系统"
+	@echo "小智WebSocket客户端 构建系统"
 	@echo
 	@echo "使用方法:"
 	@echo "  make [target]"

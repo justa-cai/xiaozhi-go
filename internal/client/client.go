@@ -35,7 +35,7 @@ const (
 	DefaultOpusFrameDuration = 60 // 毫秒
 )
 
-// Client 定义小知客户端结构
+// Client 定义小智客户端结构
 type Client struct {
 	// 协议实现
 	protocol protocol.Protocol

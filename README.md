@@ -1,10 +1,10 @@
-# 小知(Xiaozhi)智能语音助手客户端
+# 小智(Xiaozhi)智能语音助手客户端
 
 [![Go版本](https://img.shields.io/badge/Go-1.20+-00ADD8?style=flat&logo=go)](https://golang.org/)
 [![许可证](https://img.shields.io/badge/许可证-MIT-green)](LICENSE)
 [![构建状态](https://img.shields.io/github/actions/workflow/status/JustaCai/xiaozhi-go/build.yml?branch=main)](https://github.com/justa-cai/xiaozhi-go/actions/workflows/build.yml)
 
-小知(Xiaozhi)是一个基于WebSocket协议的智能语音助手客户端，支持实时语音识别、对话和物联网控制功能。
+小智(Xiaozhi)是一个基于WebSocket协议的智能语音助手客户端，支持实时语音识别、对话和物联网控制功能。
 
 ## 功能特点
 
