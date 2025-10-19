@@ -28,6 +28,15 @@ type VADDetector struct {
 	silenceStartTime time.Time
 	isSilence       bool
 	silenceTimeout time.Duration
+
+	// VAD暂停状态（用于TTS播放期间）
+	isPaused bool
+
+	// VAD恢复时间（用于延迟启动检测）
+	lastResumeTime time.Time
+
+	// VAD回调宽限期（防止TTS结束后立即触发）
+	callbackGracePeriod time.Duration
 }
 
 // VADConfig VAD配置
@@ -205,6 +214,62 @@ func (v *VADDetector) ProcessAudioData(samples []int16) error {
 		return nil
 	}
 
+	// 如果VAD被暂停（TTS播放期间），跳过处理
+	if v.isPaused {
+		return nil
+	}
+
+	// 检查是否在VAD恢复的宽限期内（避免TTS播放结束后的残留音频影响检测）
+	if !v.lastResumeTime.IsZero() {
+		timeSinceResume := time.Since(v.lastResumeTime)
+		if timeSinceResume < 500*time.Millisecond {
+			// 在恢复后的500ms宽限期内，只处理音频但不进行静音检测
+			logrus.Debugf("VAD在宽限期内，已处理音频但跳过静音检测（恢复后%.0fms）", timeSinceResume.Milliseconds())
+
+			// 仍然需要将音频数据添加到缓冲区并处理，保持VAD状态同步
+			floatSamples := make([]float32, len(samples))
+			for i, sample := range samples {
+				floatSamples[i] = float32(sample) / 32768.0
+			}
+			v.buffer.Push(floatSamples)
+
+			// 处理音频窗口但不触发静音检测回调
+			for int(v.buffer.Size()) >= v.windowSize {
+				head := v.buffer.Head()
+				windowSamples := v.buffer.Get(int(head), v.windowSize)
+				v.buffer.Pop(v.windowSize)
+
+				// 输入到VAD检测器
+				v.detector.AcceptWaveform(windowSamples)
+
+				// 检测语音活动并更新内部状态，但不触发回调
+				isSpeech := v.detector.IsSpeech()
+
+				if isSpeech && v.isSilence {
+					// 从静音状态切换到语音状态
+					v.isSilence = false
+					v.silenceStartTime = time.Time{}
+					logrus.Debugf("VAD宽限期内：检测到语音活动，重置静音状态")
+				} else if !isSpeech && !v.isSilence {
+					// 从语音状态切换到静音状态，但在宽限期内不触发回调
+					v.isSilence = true
+					v.silenceStartTime = time.Now()
+					logrus.Debugf("VAD宽限期内：检测到静音，开始记录静音时间但不触发回调")
+				}
+
+				// 处理语音段（仅用于清理VAD内部状态）
+				for !v.detector.IsEmpty() {
+					speechSegment := v.detector.Front()
+					v.detector.Pop()
+					duration := float32(len(speechSegment.Samples)) / float32(v.sampleRate)
+					logrus.Debugf("VAD宽限期内：处理语音段，持续时间 %.2f 秒", duration)
+				}
+			}
+
+			return nil
+		}
+	}
+
 	// 转换音频数据格式
 	floatSamples := make([]float32, len(samples))
 	for i, sample := range samples {
@@ -241,7 +306,10 @@ func (v *VADDetector) ProcessAudioData(samples []int16) error {
 			v.silenceStartTime = time.Now()
 			logrus.Debugf("VAD: 检测到静音，从语音切换到静音状态")
 
-			if v.onSilence != nil {
+			// 检查是否在回调宽限期内（防止TTS结束后立即触发）
+			if !v.lastResumeTime.IsZero() && time.Since(v.lastResumeTime) < v.callbackGracePeriod {
+				logrus.Debugf("VAD: 在回调宽限期内，跳过静音回调（恢复后%.0fms）", time.Since(v.lastResumeTime).Milliseconds())
+			} else if v.onSilence != nil {
 				v.onSilence()
 			}
 		} else if !isSpeech && v.isSilence {
@@ -251,8 +319,10 @@ func (v *VADDetector) ProcessAudioData(samples []int16) error {
 				logrus.Debugf("VAD: 静音持续时间 %.2f 秒，超过阈值 %.2f 秒",
 					silenceDuration.Seconds(), v.silenceTimeout.Seconds())
 
-				// 触发静音超时回调
-				if v.onSilence != nil {
+				// 检查是否在回调宽限期内（防止TTS结束后立即触发）
+				if !v.lastResumeTime.IsZero() && time.Since(v.lastResumeTime) < v.callbackGracePeriod {
+					logrus.Debugf("VAD: 在回调宽限期内，跳过静音超时回调（恢复后%.0fms）", time.Since(v.lastResumeTime).Milliseconds())
+				} else if v.onSilence != nil {
 					v.onSilence()
 				}
 			}
@@ -350,6 +420,54 @@ func (v *VADDetector) Cleanup() {
 
 	v.isRunning = false
 	logrus.Debug("VAD资源已清理")
+}
+
+// Pause 暂停VAD检测（用于TTS播放期间）
+func (v *VADDetector) Pause() {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	if !v.isPaused {
+		v.isPaused = true
+		logrus.Debug("🔇 VAD检测已暂停（TTS播放期间）")
+	}
+}
+
+// Resume 恢复VAD检测（TTS播放结束后）
+func (v *VADDetector) Resume() {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	if v.isPaused {
+		v.isPaused = false
+		// 重置静音状态，避免TTS播放期间的静音影响检测
+		v.isSilence = false
+		v.silenceStartTime = time.Time{}
+
+	// 清空VAD检测器缓冲区，避免TTS播放期间的音频数据影响检测
+		if v.detector != nil {
+			for !v.detector.IsEmpty() {
+				v.detector.Pop()
+			}
+		}
+		if v.buffer != nil {
+			for v.buffer.Size() > 0 {
+				v.buffer.Pop(v.buffer.Size())
+			}
+		}
+
+		// 添加恢复时间戳和回调宽限期，用于实现延迟启动检测
+		v.lastResumeTime = time.Now()
+		v.callbackGracePeriod = 1 * time.Second // 设置1秒的回调宽限期
+		logrus.Debug("🔊 VAD检测已恢复（TTS播放结束），已清空缓冲区，设置1秒回调宽限期")
+	}
+}
+
+// IsPaused 检查VAD是否被暂停
+func (v *VADDetector) IsPaused() bool {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.isPaused
 }
 
 // fileExists 检查文件是否存在

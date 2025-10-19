@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"sync"
-	"time"
 
 	sherpa "github.com/k2-fsa/sherpa-onnx-go/sherpa_onnx"
 	"github.com/sirupsen/logrus"
@@ -15,25 +14,16 @@ type WakeWordDetector struct {
 	spotter           *sherpa.KeywordSpotter
 	stream            *sherpa.OnlineStream
 	callback          func(string) // Callback when wake word is detected
-	endOfSpeechCallback func()     // Callback when end of speech is detected (after silence)
 	mu                sync.Mutex
 	running           bool
 	stopCh            chan struct{}
-	
-	// For silence detection
-	lastSpeechTime    time.Time
-	silenceTimeout    time.Duration // How long to wait before considering speech ended
-	silenceDetectionEnabled bool
 }
 
 // NewWakeWordDetector creates a new wake word detector instance
-func NewWakeWordDetector(callback func(string), endOfSpeechCallback func()) (*WakeWordDetector, error) {
+func NewWakeWordDetector(callback func(string)) (*WakeWordDetector, error) {
 	w := &WakeWordDetector{
-		callback:          callback,
-		endOfSpeechCallback: endOfSpeechCallback,
-		stopCh:            make(chan struct{}),
-		silenceTimeout:    800 * time.Millisecond, // Default: 800ms silence = end of speech
-		silenceDetectionEnabled: true,
+		callback: callback,
+		stopCh:   make(chan struct{}),
 	}
 
 	// Setup KWS (Keyword Spotting) configuration
@@ -137,50 +127,14 @@ func (w *WakeWordDetector) ProcessAudioData(pcmData []int16) {
 			// Reset the stream after detecting a keyword to avoid repeated detections
 			w.spotter.Reset(w.stream)
 
-			// Update last speech time when wake word is detected
-			w.lastSpeechTime = time.Now()
-
 			// Call the callback function
 			if w.callback != nil {
 				w.callback(result.Keyword)
 			}
 		}
 	}
-
-	// Check for silence timeout if silence detection is enabled
-	if w.silenceDetectionEnabled && !w.lastSpeechTime.IsZero() {
-		elapsed := time.Since(w.lastSpeechTime)
-		if elapsed > w.silenceTimeout {
-			// Silence timeout reached - call the end of speech callback
-			if w.endOfSpeechCallback != nil {
-				logrus.Debugf("Silence detected for %v, calling end of speech callback", elapsed)
-				w.endOfSpeechCallback()
-				// Reset the last speech time to avoid repeated callbacks
-				w.lastSpeechTime = time.Time{}
-			}
-		} else {
-			// Update last speech time to current time since we received audio data
-			w.lastSpeechTime = time.Now()
-		}
-	} else if w.silenceDetectionEnabled {
-		// If lastSpeechTime was zero (initial state), set it now since we're receiving audio
-		w.lastSpeechTime = time.Now()
-	}
 }
 
-// SetSilenceTimeout sets the silence timeout duration
-func (w *WakeWordDetector) SetSilenceTimeout(timeout time.Duration) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.silenceTimeout = timeout
-}
-
-// GetSilenceTimeout gets the current silence timeout duration
-func (w *WakeWordDetector) GetSilenceTimeout() time.Duration {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.silenceTimeout
-}
 
 // onRecvFrames handles incoming audio frames (for backward compatibility if needed)
 func (w *WakeWordDetector) onRecvFrames(_, pSample []byte, framecount uint32) {
@@ -199,34 +153,11 @@ func (w *WakeWordDetector) onRecvFrames(_, pSample []byte, framecount uint32) {
 			// Reset the stream after detecting a keyword to avoid repeated detections
 			w.spotter.Reset(w.stream)
 
-			// Update last speech time when wake word is detected
-			w.lastSpeechTime = time.Now()
-
 			// Call the callback function
 			if w.callback != nil {
 				w.callback(result.Keyword)
 			}
 		}
-	}
-
-	// Check for silence timeout if silence detection is enabled
-	if w.silenceDetectionEnabled && !w.lastSpeechTime.IsZero() {
-		elapsed := time.Since(w.lastSpeechTime)
-		if elapsed > w.silenceTimeout {
-			// Silence timeout reached - call the end of speech callback
-			if w.endOfSpeechCallback != nil {
-				logrus.Debugf("Silence detected for %v, calling end of speech callback", elapsed)
-				w.endOfSpeechCallback()
-				// Reset the last speech time to avoid repeated callbacks
-				w.lastSpeechTime = time.Time{}
-			}
-		} else {
-			// Update last speech time to current time since we received audio data
-			w.lastSpeechTime = time.Now()
-		}
-	} else if w.silenceDetectionEnabled {
-		// If lastSpeechTime was zero (initial state), set it now since we're receiving audio
-		w.lastSpeechTime = time.Now()
 	}
 }
 
