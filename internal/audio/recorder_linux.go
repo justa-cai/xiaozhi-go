@@ -32,17 +32,20 @@ import (
 )
 
 type linuxRecorder struct {
-	isRecording bool
-	onAudioData func([]byte)
-	onPCMData   func([]int16, int)
-	stopCh      chan struct{}
-	mu          sync.Mutex
-	handle      *C.pa_simple
-	wg          sync.WaitGroup
+	isRecording      bool
+	audioCallbacks   map[string]func([]byte)
+	pcmCallbacks     map[string]func([]int16, int)
+	stopCh           chan struct{}
+	mu               sync.RWMutex
+	handle           *C.pa_simple
+	wg               sync.WaitGroup
 }
 
 func newRecorder() Recorder {
-	return &linuxRecorder{}
+	return &linuxRecorder{
+		audioCallbacks: make(map[string]func([]byte)),
+		pcmCallbacks:   make(map[string]func([]int16, int)),
+	}
 }
 
 func (r *linuxRecorder) StartRecording(codec Encoder) error {
@@ -81,16 +84,35 @@ func (r *linuxRecorder) StartRecording(codec Encoder) error {
 				continue // 采集失败，跳过
 			}
 			// 回调PCM数据
-			if r.onPCMData != nil {
+			r.mu.RLock()
+			pcmCallbacks := make(map[string]func([]int16, int))
+			for id, cb := range r.pcmCallbacks {
+				pcmCallbacks[id] = cb
+			}
+			r.mu.RUnlock()
+			
+			if len(pcmCallbacks) > 0 {
 				pcmCopy := make([]int16, framesPerBuffer*int(channels))
 				copy(pcmCopy, buf[:framesPerBuffer*int(channels)])
-				r.onPCMData(pcmCopy, framesPerBuffer*int(channels))
+				for _, cb := range pcmCallbacks {
+					cb(pcmCopy, framesPerBuffer*int(channels))
+				}
 			}
+			
 			// 回调原始字节数据
-			if r.onAudioData != nil {
+			r.mu.RLock()
+			audioCallbacks := make(map[string]func([]byte))
+			for id, cb := range r.audioCallbacks {
+				audioCallbacks[id] = cb
+			}
+			r.mu.RUnlock()
+			
+			if len(audioCallbacks) > 0 {
 				dataCopy := make([]byte, bufSize)
 				copy(dataCopy, byteBuf[:bufSize])
-				r.onAudioData(dataCopy)
+				for _, cb := range audioCallbacks {
+					cb(dataCopy)
+				}
 			}
 		}
 	}()
@@ -121,16 +143,42 @@ func (r *linuxRecorder) Close() error {
 	return r.StopRecording()
 }
 
-func (r *linuxRecorder) SetAudioDataCallback(cb func([]byte)) {
-	r.onAudioData = cb
+func (r *linuxRecorder) AddAudioDataCallback(id string, cb func([]byte)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.audioCallbacks == nil {
+		r.audioCallbacks = make(map[string]func([]byte))
+	}
+	r.audioCallbacks[id] = cb
 }
 
-func (r *linuxRecorder) SetPCMDataCallback(cb func([]int16, int)) {
-	r.onPCMData = cb
+func (r *linuxRecorder) RemoveAudioDataCallback(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.audioCallbacks != nil {
+		delete(r.audioCallbacks, id)
+	}
+}
+
+func (r *linuxRecorder) AddPCMDataCallback(id string, cb func([]int16, int)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.pcmCallbacks == nil {
+		r.pcmCallbacks = make(map[string]func([]int16, int))
+	}
+	r.pcmCallbacks[id] = cb
+}
+
+func (r *linuxRecorder) RemovePCMDataCallback(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.pcmCallbacks != nil {
+		delete(r.pcmCallbacks, id)
+	}
 }
 
 func (r *linuxRecorder) IsRecording() bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	return r.isRecording
 }

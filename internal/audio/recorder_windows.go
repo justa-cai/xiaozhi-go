@@ -83,15 +83,18 @@ import (
 )
 
 type winRecorder struct {
-	isRecording bool
-	onAudioData func([]byte)
-	onPCMData   func([]int16, int)
-	stopCh      chan struct{}
-	mu          sync.Mutex
+	isRecording    bool
+	audioCallbacks map[string]func([]byte)
+	pcmCallbacks   map[string]func([]int16, int)
+	stopCh         chan struct{}
+	mu             sync.RWMutex
 }
 
 func newRecorder() Recorder {
-	return &winRecorder{}
+	return &winRecorder{
+		audioCallbacks: make(map[string]func([]byte)),
+		pcmCallbacks:   make(map[string]func([]int16, int)),
+	}
 }
 
 func (r *winRecorder) StartRecording(codec Encoder) error {
@@ -122,21 +125,39 @@ func (r *winRecorder) StartRecording(codec Encoder) error {
 				// 取出缓冲区数据
 				buf := (*[1 << 20]C.short)(unsafe.Pointer(C.buffer))[:int(n)]
 				// 回调PCM数据
-				if r.onPCMData != nil {
+				r.mu.RLock()
+				pcmCallbacks := make(map[string]func([]int16, int))
+				for id, cb := range r.pcmCallbacks {
+					pcmCallbacks[id] = cb
+				}
+				r.mu.RUnlock()
+				
+				if len(pcmCallbacks) > 0 {
 					pcm := make([]int16, int(n))
 					for i := 0; i < int(n); i++ {
 						pcm[i] = int16(buf[i])
 					}
-					r.onPCMData(pcm, int(n))
+					for _, cb := range pcmCallbacks {
+						cb(pcm, int(n))
+					}
 				}
 				// 回调原始字节数据
-				if r.onAudioData != nil {
+				r.mu.RLock()
+				audioCallbacks := make(map[string]func([]byte))
+				for id, cb := range r.audioCallbacks {
+					audioCallbacks[id] = cb
+				}
+				r.mu.RUnlock()
+				
+				if len(audioCallbacks) > 0 {
 					b := make([]byte, int(n)*2)
 					for i := 0; i < int(n); i++ {
 						b[2*i] = byte(buf[i])
 						b[2*i+1] = byte(buf[i] >> 8)
 					}
-					r.onAudioData(b)
+					for _, cb := range audioCallbacks {
+						cb(b)
+					}
 				}
 				time.Sleep(10 * time.Millisecond)
 			} else {
@@ -163,16 +184,42 @@ func (r *winRecorder) Close() error {
 	return r.StopRecording()
 }
 
-func (r *winRecorder) SetAudioDataCallback(cb func([]byte)) {
-	r.onAudioData = cb
+func (r *winRecorder) AddAudioDataCallback(id string, cb func([]byte)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.audioCallbacks == nil {
+		r.audioCallbacks = make(map[string]func([]byte))
+	}
+	r.audioCallbacks[id] = cb
 }
 
-func (r *winRecorder) SetPCMDataCallback(cb func([]int16, int)) {
-	r.onPCMData = cb
+func (r *winRecorder) RemoveAudioDataCallback(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.audioCallbacks != nil {
+		delete(r.audioCallbacks, id)
+	}
+}
+
+func (r *winRecorder) AddPCMDataCallback(id string, cb func([]int16, int)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.pcmCallbacks == nil {
+		r.pcmCallbacks = make(map[string]func([]int16, int))
+	}
+	r.pcmCallbacks[id] = cb
+}
+
+func (r *winRecorder) RemovePCMDataCallback(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.pcmCallbacks != nil {
+		delete(r.pcmCallbacks, id)
+	}
 }
 
 func (r *winRecorder) IsRecording() bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	return r.isRecording
 }

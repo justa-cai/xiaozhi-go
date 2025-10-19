@@ -7,7 +7,7 @@ all: build
 
 # Build all binaries
 build:
-	go build -o bin/xiaozhi cmd/main.go
+	go build -o bin/xiaozhi cmd/client/main.go
 
 # Run the main application
 run: build

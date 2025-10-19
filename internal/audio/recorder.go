@@ -6,8 +6,10 @@ type Recorder interface {
 	StartRecording(codec Encoder) error
 	StopRecording() error
 	Close() error
-	SetAudioDataCallback(cb func([]byte))
-	SetPCMDataCallback(cb func([]int16, int))
+	AddAudioDataCallback(id string, cb func([]byte))
+	RemoveAudioDataCallback(id string)
+	AddPCMDataCallback(id string, cb func([]int16, int))
+	RemovePCMDataCallback(id string)
 	IsRecording() bool
 }
 

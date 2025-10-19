@@ -26,7 +26,6 @@ type AudioManagerNew struct {
 	sampleRate        int             // 采样率
 	channelCount      int             // 通道数
 	frameDuration     int             // 帧持续时间（毫秒）
-	audioDataCallback func([]byte)    // 保存音频数据回调函数
 }
 
 // AudioManagerOptions 音频管理器选项
@@ -174,23 +173,38 @@ func (m *AudioManagerNew) Close() error {
 	return nil
 }
 
-// SetAudioDataCallback 设置opus编码后音频数据回调函数
-func (m *AudioManagerNew) SetAudioDataCallback(callback func([]byte)) {
-	// 保存回调
-	m.audioDataCallback = callback
+// AddAudioDataCallback 添加opus编码后音频数据回调函数
+func (m *AudioManagerNew) AddAudioDataCallback(id string, callback func([]byte)) {
 	// 设置PCM回调，编码后回调opus数据
-	m.recorder.SetPCMDataCallback(func(pcm []int16, _ int) {
-		if m.audioDataCallback != nil && m.codec != nil {
+	m.recorder.AddPCMDataCallback("opus_"+id, func(pcm []int16, _ int) {
+		if m.codec != nil {
 			if opus, err := m.codec.Encode(pcm); err == nil {
-				m.audioDataCallback(opus)
+				callback(opus)
 			}
 		}
 	})
 }
 
+// RemoveAudioDataCallback 移除opus编码后音频数据回调函数
+func (m *AudioManagerNew) RemoveAudioDataCallback(id string) {
+	m.recorder.RemovePCMDataCallback("opus_"+id)
+}
+
+// AddPCMDataCallback 添加PCM音频数据回调函数
+func (m *AudioManagerNew) AddPCMDataCallback(id string, callback func([]int16, int)) {
+	m.recorder.AddPCMDataCallback(id, callback)
+}
+
+// This method was replaced by AddPCMDataCallback and RemovePCMDataCallback
 // SetPCMDataCallback 设置PCM音频数据回调函数
 func (m *AudioManagerNew) SetPCMDataCallback(callback func([]int16, int)) {
-	m.recorder.SetPCMDataCallback(callback)
+	// For backward compatibility, we'll use a default ID
+	m.recorder.AddPCMDataCallback("default", callback)
+}
+
+// RemovePCMDataCallback 移除PCM音频数据回调函数
+func (m *AudioManagerNew) RemovePCMDataCallback(id string) {
+	m.recorder.RemovePCMDataCallback(id)
 }
 
 // StartRecording 开始录音

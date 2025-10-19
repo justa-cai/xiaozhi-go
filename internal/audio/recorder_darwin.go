@@ -18,15 +18,18 @@ import (
 )
 
 type darwinRecorder struct {
-	isRecording bool
-	onAudioData func([]byte)
-	onPCMData   func([]int16, int)
-	stopCh      chan struct{}
-	mu          sync.Mutex
+	isRecording    bool
+	audioCallbacks map[string]func([]byte)
+	pcmCallbacks   map[string]func([]int16, int)
+	stopCh         chan struct{}
+	mu             sync.RWMutex
 }
 
 func newRecorder() Recorder {
-	return &darwinRecorder{}
+	return &darwinRecorder{
+		audioCallbacks: make(map[string]func([]byte)),
+		pcmCallbacks:   make(map[string]func([]int16, int)),
+	}
 }
 
 func (r *darwinRecorder) StartRecording(codec Encoder) error {
@@ -58,14 +61,41 @@ func (r *darwinRecorder) StopRecording() error {
 func (r *darwinRecorder) Close() error {
 	return r.StopRecording()
 }
-func (r *darwinRecorder) SetAudioDataCallback(cb func([]byte)) {
-	r.onAudioData = cb
-}
-func (r *darwinRecorder) SetPCMDataCallback(cb func([]int16, int)) {
-	r.onPCMData = cb
-}
-func (r *darwinRecorder) IsRecording() bool {
+func (r *darwinRecorder) AddAudioDataCallback(id string, cb func([]byte)) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.audioCallbacks == nil {
+		r.audioCallbacks = make(map[string]func([]byte))
+	}
+	r.audioCallbacks[id] = cb
+}
+
+func (r *darwinRecorder) RemoveAudioDataCallback(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.audioCallbacks != nil {
+		delete(r.audioCallbacks, id)
+	}
+}
+
+func (r *darwinRecorder) AddPCMDataCallback(id string, cb func([]int16, int)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.pcmCallbacks == nil {
+		r.pcmCallbacks = make(map[string]func([]int16, int))
+	}
+	r.pcmCallbacks[id] = cb
+}
+
+func (r *darwinRecorder) RemovePCMDataCallback(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.pcmCallbacks != nil {
+		delete(r.pcmCallbacks, id)
+	}
+}
+func (r *darwinRecorder) IsRecording() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	return r.isRecording
 }

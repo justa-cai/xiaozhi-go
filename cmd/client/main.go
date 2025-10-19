@@ -19,6 +19,7 @@ import (
 	"github.com/justa-cai/xiaozhi-go/internal/client"
 	"github.com/justa-cai/xiaozhi-go/internal/ota"
 	"github.com/justa-cai/xiaozhi-go/internal/protocol"
+	"github.com/justa-cai/xiaozhi-go/internal/wakeword"
 	"github.com/sirupsen/logrus"
 )
 
@@ -44,12 +45,29 @@ var (
 	debugEnabled bool
 	// 添加详细日志标志
 	verboseLogging bool
+	// 添加唤醒词检测标志
+	enableWakeWord bool
+	// 添加VAD标志 (已移除)
+	// enableVAD bool
+	// 添加静音超时时间（毫秒）
+	silenceTimeoutMs int
 )
 
 // 全局音频管理器
 var (
 	audioManager *audio.AudioManagerNew
 	audioPlayer  *audio.AudioPlayerNew
+)
+
+// 全局唤醒词检测器
+var (
+	wakeWordDetector *wakeword.WakeWordDetector
+	wakeWordTimer    *time.Timer
+)
+
+// 全局录音控制标志
+var (
+	sendToServer bool = false
 )
 
 // 定义一个全局变量，用于追踪是否已恢复终端设置
@@ -76,14 +94,17 @@ func init() {
 	flag.BoolVar(&debugEnabled, "debug", false, "启用高级调试功能")
 	// 添加详细日志标志
 	flag.BoolVar(&verboseLogging, "verbose", false, "启用详细日志")
+	// 添加唤醒词检测标志
+	flag.BoolVar(&enableWakeWord, "wakeword", false, "启用唤醒词检测功能")
+	// VAD functionality has been removed
+	// 添加静音超时时间（毫秒）
+	flag.IntVar(&silenceTimeoutMs, "silence-timeout", 800, "静音超时时间（毫秒），超过此时间无语音则自动停止录音")
 
 	// 配置日志
 	logrus.SetFormatter(&logrus.TextFormatter{
 		FullTimestamp:   true,
 		TimestampFormat: "2006-01-02 15:04:05",
 	})
-	// 默认使用debug级别
-	logrus.SetLevel(logrus.InfoLevel)
 
 	// 添加一个日志钩子，以便跟踪WebSocket连接过程
 	logrus.AddHook(&WebSocketLogHook{})
@@ -159,6 +180,24 @@ func cleanupAndExit(c *client.Client, code int) {
 
 	// 使用goroutine并行处理所有清理工作
 	var wg sync.WaitGroup
+
+	// 关闭唤醒词检测器
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if wakeWordDetector != nil {
+			logrus.Debug("正在停止唤醒词检测器...")
+			if err := wakeWordDetector.Stop(); err != nil {
+				logrus.Errorf("停止唤醒词检测器失败: %v", err)
+			}
+		}
+		// 停止唤醒词定时器
+		if wakeWordTimer != nil {
+			wakeWordTimer.Stop()
+			wakeWordTimer = nil
+			logrus.Debug("已停止唤醒词定时器")
+		}
+	}()
 
 	// 关闭客户端连接 - 最优先处理
 	if c != nil {
@@ -260,7 +299,7 @@ func main() {
 		logrus.SetLevel(logrus.PanicLevel)
 	default:
 		logrus.Warnf("未知的日志级别: %s，使用默认级别 debug", logLevel)
-		logrus.SetLevel(logrus.InfoLevel)
+		logrus.SetLevel(logrus.DebugLevel)
 	}
 
 	// 在程序退出时确保恢复终端设置
@@ -473,11 +512,19 @@ func main() {
 		}
 	})
 
-	// 显示按键操作说明
-	fmt.Println("按键操作:")
-	fmt.Println("  f - 开始录音")
-	fmt.Println("  s - 停止录音")
-	fmt.Println("  q - 退出程序")
+	// 显示操作说明
+	if enableWakeWord {
+		fmt.Println("唤醒词检测模式已启用:")
+		fmt.Println("  说出 '你好小智' 或 '小智同学' 来激活助手")
+		fmt.Println("  f - 开始录音")
+		fmt.Println("  s - 停止录音")
+		fmt.Println("  q - 退出程序")
+	} else {
+		fmt.Println("按键操作:")
+		fmt.Println("  f - 开始录音")
+		fmt.Println("  s - 停止录音")
+		fmt.Println("  q - 退出程序")
+	}
 
 	// 启动按键监听
 	keyPressCh := make(chan string)
@@ -499,10 +546,206 @@ func main() {
 	// 设置握手超时
 	proto.SetHandshakeTimeout(15 * time.Second)
 
-	// 	// 连接
+	// 初始化唤醒词检测器（如果启用）
+	if enableWakeWord {
+		logrus.Info("正在初始化唤醒词检测器...")
+		var err error
+		// 添加一个标志来跟踪是否已经检测到唤醒词
+		var wakeWordDetected bool = false
+		// 添加静音开始时间跟踪
+		var silenceStartTime time.Time
+
+		// 最大录音时长10秒
+		const maxRecordingDuration = 10 * time.Second
+
+		wakeWordDetector, err = wakeword.NewWakeWordDetector(
+			func(keyword string) {
+				// 唤醒词检测回调函数
+				logrus.Infof("唤醒词 '%s' 检测到！激活助手...", keyword)
+
+				// 检查客户端是否已连接到服务器
+				if !c.GetProtocol().IsConnected() {
+					logrus.Error("客户端未连接到服务器，无法开始录音")
+					return
+				}
+
+				// 检查当前状态
+				currentState := c.GetState()
+				if currentState == client.StateListening {
+					// 如果已经在监听状态，说明是再次唤醒
+					logrus.Info("客户端已在监听状态，检测到唤醒词...")
+					wakeWordDetected = true
+				} else {
+					// 如果不在监听状态，开始监听（等同于按F键）
+					logrus.Info("进入监听模式（等同于按F键）...")
+
+					// 发送开始录音命令到服务器
+					if err := c.SendStartListening(client.ListenModeManual); err != nil {
+						logrus.Errorf("发送开始监听命令失败: %v", err)
+						return
+					}
+					logrus.Info("已向服务器发送开始监听命令，准备接收语音输入...")
+
+					// 开始录音 - 在唤醒词检测模式下，我们只需确保音频数据被发送到服务器
+					// 音频管理器应该已经在运行，我们只需要激活音频数据发送
+					logrus.Infof("唤醒词检测回调：开始录音，当前客户端状态: %s", c.GetState())
+					startRecording(c)
+
+					// 设置唤醒词检测标志
+					wakeWordDetected = true
+					// 重置静音开始时间
+					silenceStartTime = time.Time{} // 零值，表示还没有静音
+
+					// 设置10秒超时定时器
+					if wakeWordTimer != nil {
+						wakeWordTimer.Stop()
+					}
+					wakeWordTimer = time.AfterFunc(maxRecordingDuration, func() {
+						if wakeWordDetected && c.GetState() == client.StateListening {
+							logrus.Info("录音达到最大时长10秒，自动停止录音（等同于按S键）...")
+							stopRecording(c)
+							wakeWordDetected = false
+						}
+					})
+					logrus.Infof("已设置%d秒自动停止定时器", maxRecordingDuration/time.Second)
+				}
+			},
+			func() {
+				// End of speech callback - called when silence is detected after wake word
+				logrus.Debug("VAD检测到静音...")
+				logrus.Debugf("静音回调触发时的客户端状态: %s, wakeWordDetected: %v", c.GetState(), wakeWordDetected)
+
+				// 只有在唤醒词检测成功后才处理静音检测
+				if wakeWordDetected {
+					if c.GetState() == client.StateListening {
+						// 如果是第一次检测到静音，记录静音开始时间
+						if silenceStartTime.IsZero() {
+							silenceStartTime = time.Now()
+							logrus.Infof("🎯 唤醒词模式：开始记录静音时间，静音开始于: %v", silenceStartTime.Format("15:04:05.000"))
+							return // 第一次检测到静音时不停止，等待持续静音
+						}
+
+						// 计算持续静音的时间
+						silenceDuration := time.Since(silenceStartTime)
+						logrus.Infof("🎯 唤醒词模式：持续静音时间: %.2f秒", silenceDuration.Seconds())
+
+						if silenceDuration >= 3*time.Second {
+							logrus.Info("✅ 连续3秒检测不到声音，自动停止录音（等同于按S键）...")
+							// 停止录音（等同于按S键）
+							stopRecording(c)
+							// 重置标志和定时器
+							wakeWordDetected = false
+							silenceStartTime = time.Time{} // 重置静音时间
+							if wakeWordTimer != nil {
+								wakeWordTimer.Stop()
+								wakeWordTimer = nil
+							}
+						} else {
+							logrus.Debugf("🎯 唤醒词模式：静音时长: %.2f秒，未达到3秒，继续等待...", silenceDuration.Seconds())
+						}
+					} else {
+						logrus.Debugf("🎯 唤醒词模式：客户端状态为 %s，不处理静音", c.GetState())
+					}
+				} else {
+					// 非唤醒词模式下的静音检测不处理
+					logrus.Debug("非唤醒词模式下的静音检测，忽略")
+				}
+			})
+		if err != nil {
+			logrus.Errorf("初始化唤醒词检测器失败: %v", err)
+		} else {
+			if err := wakeWordDetector.Start(); err != nil {
+				logrus.Errorf("启动唤醒词检测器失败: %v", err)
+			} else {
+				logrus.Info("唤醒词检测器已启动")
+
+				// 设置静音超时时间为1秒，使VAD更频繁地调用静音检测回调
+				// 这样我们可以在回调中自己控制3秒的静音检测逻辑
+				silenceTimeout := 1 * time.Second
+				wakeWordDetector.SetSilenceTimeout(silenceTimeout)
+				logrus.Infof("VAD静音超时设置为: %v（用于更频繁的静音检测）", silenceTimeout)
+
+				// 设置音频数据回调 to send data to server when recording is active
+				// We'll set it initially but control sending via a flag
+				if audioManager != nil {
+					// Add audio data callback to conditionally send to server
+					audioManager.AddAudioDataCallback("server_sender", func(data []byte) {
+						// logrus.Debugf("音频数据回调被调用，大小: %d 字节，sendToServer: %v, audioChan: %v", len(data), sendToServer, audioChan != nil)
+						if sendToServer && audioChan != nil {
+							// logrus.Debugf("接收到音频数据，大小: %d 字节，发送到服务器 (WakeWord Mode)", len(data))
+
+							// 发送到通道，不阻塞
+							select {
+							case audioChan <- data:
+								// logrus.Debugf("音频数据已发送到通道，大小: %d 字节 (WakeWord Mode)", len(data))
+							default:
+								// 通道已满，丢弃此数据包
+								logrus.Warn("音频数据通道已满，丢弃数据包 (WakeWord Mode)")
+							}
+						}
+						//  else {
+						// When not sending to server, just log for debugging
+						// logrus.Debugf("音频数据已接收但未发送到服务器（当前非录音状态或通道未初始化），sendToServer: %v, audioChan: %v", sendToServer, audioChan != nil)
+						// }
+					})
+
+					// Add PCM callback for wake word detection
+					audioManager.AddPCMDataCallback("wake_word_detector", func(data []int16, size int) {
+						// logrus.Debugf("PCM音频数据回调被调用，大小: %d", size)
+						// 复制数据以避免竞争条件
+						dataCopy := make([]int16, size)
+						copy(dataCopy, data[:size])
+
+						// 将音频数据传递给唤醒词检测器 (always, even when recording)
+						if wakeWordDetector != nil && wakeWordDetector.IsRunning() {
+							wakeWordDetector.ProcessAudioData(dataCopy)
+						}
+					})
+
+					// 开始持续录音 - the audio manager runs continuously
+					// Audio data will be sent to server only when in active recording state
+					if err := audioManager.StartRecording(); err != nil {
+						logrus.Errorf("启动持续录音失败: %v", err)
+					} else {
+						logrus.Info("持续录音已启动，用于唤醒词检测和语音输入")
+					}
+				}
+			}
+		}
+	} else {
+		// 如果没有启用唤醒词检测，设置默认的PCM数据回调 and audio data callback for normal operation
+		if audioManager != nil {
+			audioManager.AddPCMDataCallback("normal_mode_pcm", func(data []int16, size int) {
+				// 复制数据以避免竞争条件
+				dataCopy := make([]int16, size)
+				copy(dataCopy, data[:size])
+			})
+
+			// In normal mode, add the audio data callback to always send to server when recording
+			audioManager.AddAudioDataCallback("normal_mode_sender", func(data []byte) {
+				// logrus.Debugf("音频数据回调被调用（正常模式），大小: %d 字节，sendToServer: %v, audioChan: %v", len(data), sendToServer, audioChan != nil)
+				// For normal mode, send data to server if we're in recording state
+				if audioChan != nil && sendToServer {
+					logrus.Debugf("接收到音频数据，大小: %d 字节，发送到服务器", len(data))
+
+					// 发送到通道，不阻塞
+					select {
+					case audioChan <- data:
+						logrus.Debugf("音频数据已发送到通道，大小: %d 字节", len(data))
+					default:
+						// 通道已满，丢弃此数据包
+						logrus.Warn("音频数据通道已满，丢弃数据包")
+					}
+				} else {
+					// When not recording, just log for debugging
+					logrus.Debugf("音频数据已接收但未发送到服务器（当前非录音状态），sendToServer: %v, audioChan: %v", sendToServer, audioChan != nil)
+				}
+			})
+		}
+	}
+
+	// 连接服务器
 	err := proto.Connect(serverURL)
-	// connDone <- err
-	// }()
 	if err != nil {
 		logrus.Errorf("❌ 连接失败: %v", err)
 		analyzeConnectionError(err)
@@ -569,6 +812,14 @@ func safeExecute(fn func(), name string) {
 
 // handleKeyPress 处理按键事件，抽取为单独函数以便安全执行
 func handleKeyPress(c *client.Client, key string, isRecording *bool) {
+	// 在唤醒词模式下，仍然允许 'F' 和 'S' 按键功能
+	// if enableWakeWord {
+	// 	if key == "F2_PRESSED" {
+	// 		logrus.Info("唤醒词检测已启用，手动录音按键被禁用")
+	// 	}
+	// 	return
+	// }
+
 	if key == "F2_PRESSED" && !*isRecording {
 		// 先检查客户端是否已连接到服务器
 		if !c.GetProtocol().IsConnected() {
@@ -682,29 +933,8 @@ func handleKeyPress(c *client.Client, key string, isRecording *bool) {
 				return
 			}
 
-			// 停止录音
-			if audioManager != nil {
-				if err := audioManager.StopRecording(); err != nil {
-					logrus.Errorf("停止录音失败: %v", err)
-					fmt.Println("⚠️ 停止录音时出现错误")
-				} else {
-					logrus.Info("已停止录音")
-				}
-
-				// 同时向服务器发送停止监听消息
-				if err := c.SendStopListening(); err != nil {
-					logrus.Errorf("发送停止监听消息失败: %v", err)
-				} else {
-					logrus.Info("已向服务器发送停止监听消息")
-				}
-			}
-
-			// 关闭音频数据通道
-			if audioChan != nil {
-				time.Sleep(50 * time.Millisecond)
-				close(audioChan)
-				audioChan = nil
-			}
+			// 停止录音 - use the stopRecording function that properly handles both normal and wake word modes
+			stopRecording(c)
 		}
 	}
 }
@@ -715,10 +945,11 @@ func initAudio() {
 
 	logrus.Debug("开始初始化音频系统...")
 
-	// 创建音频管理器
+	// 始终初始化音频管理器，包括播放功能
+	// 即使启用唤醒词检测，我们仍需要音频管理器来 record user commands after wake word detection
 	audioManager, err = audio.NewAudioManager()
 	if err != nil {
-		logrus.Warnf("初始化音频管理器失败: %v，将无法录音", err)
+		logrus.Warnf("初始化音频管理器失败: %v，将无法录音和播放", err)
 	} else {
 		logrus.Debug("音频管理器初始化成功")
 	}
@@ -796,7 +1027,11 @@ func setupCallbacks(c *client.Client) {
 		// 处理不同的状态变更
 		if oldState != StateListening && newState == StateListening {
 			// 进入监听状态，开始录音
-			startRecording(c)
+			// Only start recording if not using wake word detection,
+			// because for wake word detection, we start recording manually after detection
+			if !enableWakeWord {
+				startRecording(c)
+			}
 		} else if oldState == StateListening && newState != StateListening {
 			// 退出监听状态，停止录音
 			stopRecording(c)
@@ -855,16 +1090,11 @@ func setupCallbacks(c *client.Client) {
 	})
 }
 
-// startRecording 开始录音
+// startRecording 开始录音 (for sending to server after wake word detection)
 func startRecording(c *client.Client) {
-	logrus.Debug("开始录音流程")
+	logrus.Debug("开始录音流程（发送到服务器）")
 	if audioManager == nil {
 		logrus.Error("音频管理器未初始化，无法录音")
-		return
-	}
-
-	if audioManager.IsRecording() {
-		logrus.Debug("已经在录音中，不需要重新开始")
 		return
 	}
 
@@ -877,25 +1107,24 @@ func startRecording(c *client.Client) {
 		logrus.Info("已向服务器发送开始监听命令")
 	}
 
-	// 如果已有通道在运行，先关闭它
+	// 检查是否已经在录音状态，避免重复设置
 	if audioChan != nil {
-		close(audioChan)
-		time.Sleep(50 * time.Millisecond)
+		logrus.Debug("录音通道已存在，无需重复设置")
+		// Just ensure we're sending to server
+		sendToServer = true
+		return
 	}
 
+	logrus.Debug("创建新的录音数据通道")
 	// 创建一个带缓冲的通道来接收音频数据
 	audioChan = make(chan []byte, 100) // 足够大的缓冲区
 
-	// 设置PCM数据回调
-	audioManager.SetPCMDataCallback(func(data []int16, size int) {
-		// 复制数据以避免竞争条件
-		dataCopy := make([]int16, size)
-		copy(dataCopy, data[:size])
-	})
-
 	// 启动一个单独的goroutine处理音频数据发送
 	go func() {
+		logrus.Debug("音频数据发送goroutine已启动")
 		for data := range audioChan {
+			logrus.Debugf("从通道接收到音频数据，准备发送到服务器，大小: %d 字节", len(data))
+
 			// 发送音频数据到服务器
 			startTime := time.Now()
 			err := c.SendAudioData(data)
@@ -903,42 +1132,41 @@ func startRecording(c *client.Client) {
 
 			if err != nil {
 				logrus.Errorf("发送音频数据失败: %v", err)
-			} else if elapsed > 100*time.Millisecond {
-				logrus.Warnf("发送音频数据耗时较长: %v，数据大小: %d字节", elapsed, len(data))
+			} else {
+				logrus.Debugf("音频数据已成功发送到服务器，大小: %d 字节，耗时: %v", len(data), elapsed)
+				if elapsed > 100*time.Millisecond {
+					logrus.Warnf("发送音频数据耗时较长: %v，数据大小: %d字节", elapsed, len(data))
+				}
 			}
 		}
 		logrus.Debug("音频数据处理已停止")
 	}()
 
-	// 设置音频数据回调
-	audioManager.SetAudioDataCallback(func(data []byte) {
-		// 确保通道未关闭
-		if audioChan == nil {
+	// Enable sending audio data to server
+	sendToServer = true
+	logrus.Debugf("已设置 sendToServer = true，当前状态: %s", c.GetState())
+
+	// In wake word mode, audio manager is already running for wake word detection
+	// We should not call StartRecording again as it's already running
+	// Only start if not in wake word mode and not already recording
+	if !enableWakeWord && !audioManager.IsRecording() {
+		if err := audioManager.StartRecording(); err != nil {
+			logrus.Errorf("开始录音失败: %v，将无法发送语音", err)
+			// Clean up if we can't start recording
+			if audioChan != nil {
+				close(audioChan)
+				audioChan = nil
+			}
+			sendToServer = false
 			return
-		}
-
-		// 发送到通道，不阻塞
-		select {
-		case audioChan <- data:
-			// 成功发送数据，无需日志
-		default:
-			// 通道已满，丢弃此数据包
-			logrus.Warn("音频数据通道已满，丢弃数据包")
-		}
-	})
-
-	// 开始录音
-	var err error
-	err = audioManager.StartRecording()
-	if err != nil {
-		logrus.Errorf("开始录音失败: %v，将无法发送语音", err)
-		if audioChan != nil {
-			close(audioChan)
-			audioChan = nil
+		} else {
+			logrus.Info("音频管理器录音已启动")
 		}
 	} else {
-		logrus.Info("已成功开始录音")
+		logrus.Debug("音频管理器已在录音中或处于唤醒词检测模式")
 	}
+
+	logrus.Info("录音数据发送已激活，等待音频输入...")
 }
 
 // stopRecording 停止录音并发送停止监听消息到服务器
@@ -947,11 +1175,39 @@ func stopRecording(c *client.Client) {
 		return
 	}
 
-	// 停止录音
-	if err := audioManager.StopRecording(); err != nil {
-		logrus.Errorf("停止录音失败: %v", err)
+	// 停止向服务器发送音频数据
+	// 关闭音频数据通道
+	if audioChan != nil {
+		logrus.Debug("关闭录音数据通道")
+		time.Sleep(50 * time.Millisecond)
+		close(audioChan)
+		audioChan = nil
 	} else {
-		logrus.Info("已停止录音")
+		logrus.Debug("录音数据通道已为nil，无需关闭")
+	}
+
+	// Disable sending audio data to server
+	sendToServer = false
+	logrus.Debug("已设置 sendToServer = false")
+
+	// Note: In wake word mode, we don't stop the audio manager recording
+	// because it needs to continue for background wake word detection
+	// Only stop when not using wake word detection
+	if !enableWakeWord {
+		if err := audioManager.StopRecording(); err != nil {
+			logrus.Errorf("停止录音失败: %v", err)
+		} else {
+			logrus.Info("已停止录音")
+		}
+	} else {
+		logrus.Info("唤醒词检测模式：保持音频输入运行以继续检测唤醒词")
+
+		// 停止唤醒词录音定时器（如果存在）
+		if wakeWordTimer != nil {
+			wakeWordTimer.Stop()
+			wakeWordTimer = nil
+			logrus.Debug("已停止唤醒词录音定时器")
+		}
 	}
 
 	// 向服务器发送停止监听的消息
