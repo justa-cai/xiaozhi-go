@@ -10,10 +10,7 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-// 调试标志已在main.go中定义，这里不再重复定义
-// var (
-// 	debugEnabled = false
-// )
+var debugEnabled = false
 
 // EnableDebug 启用高级调试功能
 func EnableDebug() {
@@ -114,12 +111,7 @@ func StartAudioMonitor() chan struct{} {
 		for {
 			select {
 			case <-ticker.C:
-				if audioManager != nil {
-					logrus.Debugf("音频管理器状态: 录音=%v", audioManager.IsRecording())
-				}
-				if audioPlayer != nil {
-					logrus.Debugf("音频播放器状态: 播放=%v", audioPlayer.IsPlaying())
-				}
+				logrus.Debug("音频系统监控运行中...")
 			case <-stopCh:
 				logrus.Info("音频系统监控已停止")
 				return

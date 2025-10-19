@@ -9,10 +9,11 @@ import (
 
 // Manager 音频管理器包装器
 type Manager struct {
-	audioManager   *audio.AudioManagerNew
-	vadConfig      *audio.VADConfig
-	isInitialized  bool
-	config         AudioConfig
+	audioManager         *audio.AudioManagerNew
+	vadConfig            *audio.VADConfig
+	isInitialized        bool
+	config               AudioConfig
+	soundEffectsManager  *SoundEffectsManager
 }
 
 // AudioConfig 音频配置
@@ -85,6 +86,16 @@ func (m *Manager) Initialize() error {
 
 	m.audioManager = audioManager
 	m.isInitialized = true
+
+	// 初始化音效管理器
+	if audioManager.Player() != nil {
+		m.soundEffectsManager = NewSoundEffectsManager(audioManager.Player())
+		m.soundEffectsManager.Activate()
+		logrus.Infof("音效管理器已初始化，播放器状态: 播放中=%v, 哑模式=%v",
+			audioManager.Player().IsPlaying(), audioManager.Player().IsDummyMode())
+	} else {
+		logrus.Warn("音频播放器为空，无法初始化音效管理器")
+	}
 
 	logrus.Debug("音频管理器初始化成功")
 	if m.config.EnableVAD && m.audioManager.VAD() != nil {
@@ -222,7 +233,18 @@ func (m *Manager) RecreatePlayer(sampleRate, channels, frameDuration int) error 
 	if m.audioManager == nil {
 		return ErrManagerNil
 	}
-	return m.audioManager.RecreatePlayer(sampleRate, channels, frameDuration)
+
+	err := m.audioManager.RecreatePlayer(sampleRate, channels, frameDuration)
+	if err == nil {
+		// 播放器重建成功，更新音效管理器
+		if m.soundEffectsManager != nil && m.audioManager.Player() != nil {
+			m.soundEffectsManager = NewSoundEffectsManager(m.audioManager.Player())
+			m.soundEffectsManager.Activate()
+			logrus.Debug("音效管理器已更新到新的播放器")
+		}
+	}
+
+	return err
 }
 
 // Close 关闭音频管理器
@@ -249,4 +271,9 @@ func (m *Manager) IsInitialized() bool {
 // GetConfig 获取配置
 func (m *Manager) GetConfig() AudioConfig {
 	return m.config
+}
+
+// GetSoundEffectsManager 获取音效管理器
+func (m *Manager) GetSoundEffectsManager() *SoundEffectsManager {
+	return m.soundEffectsManager
 }

@@ -112,8 +112,25 @@ func (pc *PlaybackController) ReinitializeDecoder(sampleRate, channels, frameDur
 
 	err := pc.manager.RecreatePlayer(sampleRate, channels, frameDuration)
 	if err != nil {
-		logrus.Errorf("重建播放器失败: %v", err)
-		return err
+		logrus.Warnf("重建播放器失败: %v，尝试使用现有播放器", err)
+
+		// 尝试使用现有播放器
+		player := pc.manager.Player()
+		if player != nil {
+			if !player.IsPlaying() {
+				if err := player.Start(); err != nil {
+					logrus.Errorf("启动现有播放器失败: %v", err)
+					return err
+				} else {
+					logrus.Info("现有播放器已启动")
+				}
+			} else {
+				logrus.Info("现有播放器已在运行")
+			}
+		} else {
+			logrus.Error("无法获取播放器实例")
+			return ErrPlayerNotInitialized
+		}
 	} else {
 		player := pc.manager.Player()
 		if player != nil {

@@ -134,6 +134,15 @@ func (app *Application) Initialize() error {
 			DebugEnabled:         app.flags.DebugEnabled,
 		}
 		app.wakeWordManager = interaction.NewWakeWordManager(wakeWordConfig)
+
+		// 设置音效管理器
+		if app.audioManager != nil {
+			soundEffectsManager := app.audioManager.GetSoundEffectsManager()
+			if soundEffectsManager != nil {
+				app.wakeWordManager.SetSoundEffectsManager(soundEffectsManager)
+				logrus.Debug("音效管理器已设置到唤醒词管理器")
+			}
+		}
 	}
 
 	// 创建客户端实例
@@ -288,6 +297,15 @@ func (app *Application) setupCallbacks() error {
 					}
 					return
 				}
+
+				// 播放deng提示音表示进入连续交互模式
+				if app.audioManager != nil {
+					soundEffectsManager := app.audioManager.GetSoundEffectsManager()
+					if soundEffectsManager != nil {
+						soundEffectsManager.PlayDengSound()
+					}
+				}
+
 				go app.triggerAutoInteraction()
 			} else {
 				logrus.Debug("TTS停止：自动交互已在进行中，跳过触发")
@@ -575,6 +593,21 @@ func (app *Application) handleKeyPress(key string) {
 
 		// 开始录音
 		app.recordingController.StartRecording(app.clientInstance, app.flags.EnableWakeWord)
+
+	} else if key == "F3_PRESSED" {
+		// 测试deng声音功能
+		logrus.Info("测试deng提示音...")
+		if app.audioManager != nil {
+			soundEffectsManager := app.audioManager.GetSoundEffectsManager()
+			if soundEffectsManager != nil {
+				soundEffectsManager.PlayDengSound()
+				fmt.Println("🔔 正在播放deng测试音...")
+			} else {
+				fmt.Println("❌ 音效管理器未初始化")
+			}
+		} else {
+			fmt.Println("❌ 音频管理器未初始化")
+		}
 
 	} else if key == "F2_RELEASED" {
 		// 检查客户端当前状态

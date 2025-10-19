@@ -3,6 +3,7 @@ package interaction
 import (
 	"time"
 
+	"github.com/justa-cai/xiaozhi-go/cmd/client/audio"
 	"github.com/justa-cai/xiaozhi-go/internal/client"
 	"github.com/justa-cai/xiaozhi-go/internal/wakeword"
 	"github.com/sirupsen/logrus"
@@ -15,6 +16,7 @@ type WakeWordManager struct {
 	isRunning         bool
 	config            WakeWordConfig
 	autoInteractionMode bool
+	soundEffectsManager *audio.SoundEffectsManager
 }
 
 // WakeWordConfig 唤醒词配置
@@ -47,6 +49,11 @@ func (wwm *WakeWordManager) Initialize(
 		// 唤醒词检测回调函数
 		func(keyword string) {
 			logrus.Infof("唤醒词 '%s' 检测到！激活助手...", keyword)
+
+			// 播放deng提示音
+			if wwm.soundEffectsManager != nil {
+				wwm.soundEffectsManager.PlayDengSound()
+			}
 
 			// 检查客户端是否已连接到服务器
 			if !clientInstance.GetProtocol().IsConnected() {
@@ -174,4 +181,9 @@ func (wwm *WakeWordManager) GetDetector() interface{} {
 // IsAutoInteractionMode 检查是否处于自动交互模式
 func (wwm *WakeWordManager) IsAutoInteractionMode() bool {
 	return wwm.autoInteractionMode
+}
+
+// SetSoundEffectsManager 设置音效管理器
+func (wwm *WakeWordManager) SetSoundEffectsManager(manager *audio.SoundEffectsManager) {
+	wwm.soundEffectsManager = manager
 }
