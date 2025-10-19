@@ -4,41 +4,71 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/gen2brain/malgo"
 	sherpa "github.com/k2-fsa/sherpa-onnx-go/sherpa_onnx"
 )
 
+var (
+	verbose = flag.Bool("verbose", false, "Enable verbose debug output")
+	audioDebug = flag.Bool("audio-debug", false, "Enable audio level debugging")
+	showAll = flag.Bool("show-all", false, "Show all recognized text (not just keywords)")
+	fastSpeech = flag.Bool("fast-speech", false, "Enable fast speech detection optimizations")
+	modelPath = flag.String("model-path", "./models/sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01", "Path to model directory")
+	keywordsFile = flag.String("keywords", "./models/sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01/xiaozhi_keywords.txt", "Path to keywords file")
+)
+
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	
+
 	flag.Parse()
+
+	if *verbose {
+		log.Println("Verbose mode enabled")
+	}
 
 	// Setup KWS (Keyword Spotting) configuration
 	kwsConfig := sherpa.KeywordSpotterConfig{}
 
 	// Please download the models from
 	// https://github.com/k2-fsa/sherpa-onnx/releases/tag/kws-models
-	// Models should be placed in ./models/sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01/
-	kwsConfig.ModelConfig.Transducer.Encoder = "./models/sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01/encoder-epoch-12-avg-2-chunk-16-left-64.onnx"
-	kwsConfig.ModelConfig.Transducer.Decoder = "./models/sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01/decoder-epoch-12-avg-2-chunk-16-left-64.onnx"
-	kwsConfig.ModelConfig.Transducer.Joiner = "./models/sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01/joiner-epoch-12-avg-2-chunk-16-left-64.onnx"
-	kwsConfig.ModelConfig.Tokens = "./models/sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01/tokens.txt"
-	
-	// Use the pre-converted keywords file for xiaozhi wake words
-	keywordsFile := "./models/sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01/xiaozhi_keywords.txt"
-	
-	// Check if keywords file exists
-	if !FileExists(keywordsFile) {
-		log.Fatal("Keywords file does not exist: ", keywordsFile)
+	// Models should be placed in the directory specified by -model-path flag
+	modelDir := *modelPath
+	kwsConfig.ModelConfig.Transducer.Encoder = fmt.Sprintf("%s/encoder-epoch-12-avg-2-chunk-16-left-64.onnx", modelDir)
+	kwsConfig.ModelConfig.Transducer.Decoder = fmt.Sprintf("%s/decoder-epoch-12-avg-2-chunk-16-left-64.onnx", modelDir)
+	kwsConfig.ModelConfig.Transducer.Joiner = fmt.Sprintf("%s/joiner-epoch-12-avg-2-chunk-16-left-64.onnx", modelDir)
+	kwsConfig.ModelConfig.Tokens = fmt.Sprintf("%s/tokens.txt", modelDir)
+
+	// Use the keywords file specified by -keywords flag
+	keywordsFilePath := *keywordsFile
+
+	// Fast speech optimization: adjust keywords threshold for better sensitivity
+	if *fastSpeech {
+		log.Println("Fast speech mode enabled - using optimized keywords file")
+		// Use fast speech keywords file when fast-speech flag is enabled
+		fastKeywordsPath := *modelPath + "/xiaozhi_keywords_fast_speech.txt"
+		if FileExists(fastKeywordsPath) {
+			keywordsFilePath = fastKeywordsPath
+			log.Printf("Using fast speech keywords: %s", fastKeywordsPath)
+		} else {
+			log.Printf("Fast speech keywords file not found: %s", fastKeywordsPath)
+		}
 	}
-	
-	kwsConfig.KeywordsFile = keywordsFile
-	kwsConfig.ModelConfig.NumThreads = 1
+
+	// Check if keywords file exists
+	if !FileExists(keywordsFilePath) {
+		log.Fatal("Keywords file does not exist: ", keywordsFilePath)
+	}
+
+	kwsConfig.KeywordsFile = keywordsFilePath
+	kwsConfig.ModelConfig.NumThreads = 2 // Increase for better performance
 	kwsConfig.ModelConfig.Debug = 1
+	kwsConfig.ModelConfig.Provider = "cpu"
 
 	// Create the keyword spotter
 	spotter := sherpa.NewKeywordSpotter(&kwsConfig)
@@ -76,27 +106,105 @@ func main() {
 	}
 	defer sherpa.DeleteOnlineStream(stream)
 
+	// Print diagnostic information
+	fmt.Println("=== Wake Word Detection Diagnostics ===")
+	fmt.Printf("Keywords file: %s\n", keywordsFilePath)
+	fmt.Printf("Model files:\n")
+	fmt.Printf("  - Encoder: %s\n", kwsConfig.ModelConfig.Transducer.Encoder)
+	fmt.Printf("  - Decoder: %s\n", kwsConfig.ModelConfig.Transducer.Decoder)
+	fmt.Printf("  - Joiner: %s\n", kwsConfig.ModelConfig.Transducer.Joiner)
+	fmt.Printf("  - Tokens: %s\n", kwsConfig.ModelConfig.Tokens)
+	fmt.Printf("Audio settings: 16kHz, 1 channel, 16-bit\n")
+	fmt.Printf("Debug mode: enabled\n")
+	fmt.Printf("Provider: %s\n", kwsConfig.ModelConfig.Provider)
+	fmt.Printf("Verbose logging: %v\n", *verbose)
+	fmt.Printf("Audio debugging: %v\n", *audioDebug)
+	fmt.Printf("Show all recognized text: %v\n", *showAll)
+	fmt.Printf("Fast speech mode: %v\n", *fastSpeech)
+	fmt.Println("=========================================")
+
+	// Test keywords file loading and display keywords for debugging
+	fmt.Printf("Loading keywords from: %s\n", keywordsFilePath)
+	if *verbose || *showAll {
+		displayKeywordsFile(keywordsFilePath)
+	}
+
 	fmt.Println("Initializing audio device...")
 
+	var frameCount uint32
+
+	var speechDetected bool
+
 	onRecvFrames := func(_, pSample []byte, framecount uint32) {
+		frameCount++
 		samples := samplesInt16ToFloat(pSample)
+
+		// Calculate audio level for debugging
+		var sum float32
+		for _, sample := range samples {
+			sum += float32(sample * sample)
+		}
+		rms := float32(0)
+		if len(samples) > 0 {
+			rms = float32(math.Sqrt(float64(sum / float32(len(samples)))))
+		}
+		
+		// Detect speech activity (simple threshold-based)
+		isSpeech := rms > 0.01 // Adjust threshold as needed
+		speechStateChanged := speechDetected != isSpeech
+		speechDetected = isSpeech
+
+		// Enhanced audio debugging
+		if *audioDebug && frameCount%100 == 0 {
+			log.Printf("Audio level: %.4f, Frame: %d, Samples: %d, Speech: %v", rms, frameCount, len(samples), isSpeech)
+		}
+
+		// Log speech state changes when show-all is enabled
+		if *showAll && speechStateChanged {
+			if isSpeech {
+				log.Printf("Speech started (level: %.4f, frame: %d)", rms, frameCount)
+			} else {
+				log.Printf("Speech ended (level: %.4f, frame: %d)", rms, frameCount)
+			}
+		}
 
 		// Direct processing - feed all audio to the keyword spotter
 		stream.AcceptWaveform(16000, samples)
 
 		// Process the keyword spotter in a loop to get all possible detections
+		detectionCount := 0
 		for spotter.IsReady(stream) {
 			spotter.Decode(stream)
 			result := spotter.GetResult(stream)
 
+			// Show detection details when show-all flag is enabled
+			if *showAll && *verbose {
+				if result.Keyword != "" {
+					log.Printf("DETECTION: Keyword='%s' (frame: %d, audio_level: %.4f)", result.Keyword, frameCount, rms)
+				} else {
+					log.Printf("DETECTION: Processing audio... (frame: %d, audio_level: %.4f, speech: %v)", frameCount, rms, isSpeech)
+				}
+			}
+
+			// Fast speech detection: add more frequent processing for rapid speech
+			if detectionCount > 0 && *verbose {
+				log.Printf("FAST DETECTION: %d processing cycles in current speech segment (frame: %d)", detectionCount, frameCount)
+			}
+
 			if result.Keyword != "" {
-				log.Printf("WAKE WORD DETECTED: %s", result.Keyword)
+				log.Printf("WAKE WORD DETECTED: %s (frame: %d, audio_level: %.4f)", result.Keyword, frameCount, rms)
 				// Reset the stream after detecting a keyword to avoid repeated detections
 				spotter.Reset(stream)
 
 				// Here you can trigger your wake word response logic
 				triggerWakeWordAction(result.Keyword)
 			}
+			detectionCount++
+		}
+
+		// Log processing activity every 1000 frames
+		if *verbose && frameCount%1000 == 0 {
+			log.Printf("Processed %d frames, %d detection cycles in this batch, audio_level: %.4f", frameCount, detectionCount, rms)
 		}
 	}
 
@@ -123,6 +231,24 @@ func main() {
 	
 	fmt.Println("\nStopping wake word detection...")
 	device.Uninit()
+}
+
+func displayKeywordsFile(filePath string) {
+	fmt.Println("\n=== Keywords Configuration ===")
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		fmt.Printf("Error reading keywords file: %v\n", err)
+		return
+	}
+
+	lines := strings.Split(string(content), "\n")
+	fmt.Printf("Found %d keyword configurations:\n", len(lines))
+	for i, line := range lines {
+		if strings.TrimSpace(line) != "" {
+			fmt.Printf("  %d. %s\n", i+1, strings.TrimSpace(line))
+		}
+	}
+	fmt.Println("================================\n")
 }
 
 func triggerWakeWordAction(keyword string) {
