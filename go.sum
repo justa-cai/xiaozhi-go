@@ -1,6 +1,8 @@
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
+github.com/gen2brain/malgo v0.11.24 h1:hHcIJVfzWcEDHFdPl5Dl/CUSOjzOleY0zzAV8Kx+imE=
+github.com/gen2brain/malgo v0.11.24/go.mod h1:f9TtuN7DVrXMiV/yIceMeWpvanyVzJQMlBecJFVMxww=
 github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=
 github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=
 github.com/gorilla/websocket v1.5.1 h1:gmztn0JnHVt9JZquRuzLw3g4wouNVzKL15iLr/zn/QY=
@@ -9,6 +11,14 @@ github.com/hajimehoshi/oto v1.0.1 h1:8AMnq0Yr2YmzaiqTg/k1Yzd6IygUGk2we9nmjgbgPn4
 github.com/hajimehoshi/oto v1.0.1/go.mod h1:wovJ8WWMfFKvP587mhHgot/MBr4DnNy9m6EepeVGnos=
 github.com/justa-cai/go-libopus v0.0.0-20250601043848-aec438f1655f h1:ktmNI+dexKtDXSKCAfl6+jh9W798CjJgO53ramgAjzA=
 github.com/justa-cai/go-libopus v0.0.0-20250601043848-aec438f1655f/go.mod h1:cjtTPQXxRIpcmtxSgNHkFHum8hIc4fx7RMu6YiepZYQ=
+github.com/k2-fsa/sherpa-onnx-go v1.12.12 h1:jM0qed/KDA2JplmQZZ9IxdPkiXHYNI5Mfit8755V6sU=
+github.com/k2-fsa/sherpa-onnx-go v1.12.12/go.mod h1:B/ynRbVa5gpYoZYeYgY3zPi4MTfKk95UZueZDSIhbjk=
+github.com/k2-fsa/sherpa-onnx-go-linux v1.12.13 h1:Evh/WEvgXuVsLzOIcgEThTWMqDsjYc/VDPqnfXdXq+M=
+github.com/k2-fsa/sherpa-onnx-go-linux v1.12.13/go.mod h1:NXEH2rsBgTdqY59YpPq6CtSBlBAXy/8a9FmpLERU97I=
+github.com/k2-fsa/sherpa-onnx-go-macos v1.12.13 h1:Cw7auxYfase/roI7F4DAEQGFtgoHe5MwOCni/M/cqKc=
+github.com/k2-fsa/sherpa-onnx-go-macos v1.12.13/go.mod h1:ZOhUAXC62Unj0ZNfu6zxSFKcW96aXf7P3BsqiUyOBbE=
+github.com/k2-fsa/sherpa-onnx-go-windows v1.12.13 h1:n/cI6dgJty7JwoJcHJ/H/E0AVY7m9/jAZyS8mYvFe1s=
+github.com/k2-fsa/sherpa-onnx-go-windows v1.12.13/go.mod h1:5AX7TU8+P/gInjglY1ijtWUM2b8iyR0QX4yEngzMe64=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/sirupsen/logrus v1.9.3 h1:dueUQJ1C2q9oE3F7wvmSGAaVtTmUizReu6fjN8uqzbQ=

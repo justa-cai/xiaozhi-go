@@ -6,7 +6,7 @@
 *.dylib
 xiaozhi-client
 xiaozhi-client-*
-client
+# client
 
 # 压缩包
 *.zip

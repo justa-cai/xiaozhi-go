@@ -1,106 +1,39 @@
-# 项目名称和版本
-APP_NAME := xiaozhi-client
-VERSION := 1.0.0
-BOARD_TYPE := generic
+# Main Makefile for xiaozhi
 
-# Go相关变量
-GO := go
-GO_BUILD := $(GO) build
-GO_CLEAN := $(GO) clean
-GO_TEST := $(GO) test
-GO_MOD := $(GO) mod
-GOFLAGS :=
-LDFLAGS := -ldflags "-X main.Version=$(VERSION)"
+.PHONY: build run clean deps wake-word wake-word-run
 
-# 主目标文件
-MAIN_PKG := ./cmd/client
-TARGET := $(APP_NAME)
-
-# 默认目标
-.PHONY: all
+# Default target
 all: build
 
-# 显示帮助信息
-.PHONY: help
-help:
-	@echo "小智WebSocket客户端 构建系统"
-	@echo
-	@echo "使用方法:"
-	@echo "  make [target]"
-	@echo
-	@echo "支持的目标:"
-	@echo "  build          - 编译程序"
-	@echo "  run            - 编译并运行程序"
-	@echo "  clean          - 清理编译产物"
-	@echo "  test           - 运行测试"
-	@echo "  deps           - 下载依赖"
-	@echo "  activate       - 编译并执行激活流程"
-	@echo "  help           - 显示此帮助信息"
-	@echo
-	@echo "环境变量:"
-	@echo "  VERSION        - 设置版本号 (默认: $(VERSION))"
-	@echo "  BOARD_TYPE     - 设置设备板型号 (默认: $(BOARD_TYPE))"
-	@echo "  SERVER_URL     - 设置WebSocket服务器地址"
-	@echo "  TOKEN          - 设置API访问令牌"
-	@echo
-	@echo "示例:"
-	@echo "  make build VERSION=1.1.0"
-	@echo "  make run SERVER_URL=wss://your-server.com"
-	@echo "  make activate BOARD_TYPE=custom-board"
-
-# 构建目标
-.PHONY: build
+# Build all binaries
 build:
-	@echo "编译 $(APP_NAME) 版本 $(VERSION)..."
-	$(GO_BUILD) $(GOFLAGS) $(LDFLAGS) -o $(TARGET) $(MAIN_PKG)
-	@echo "编译完成: $(TARGET)"
+	go build -o bin/xiaozhi cmd/main.go
 
-# 运行目标
-.PHONY: run
+# Run the main application
 run: build
-	@echo "运行 $(APP_NAME)..."
-	@RUN_ARGS="-version $(VERSION) -board $(BOARD_TYPE)"; \
-	if [ ! -z "$(SERVER_URL)" ]; then \
-		RUN_ARGS="$$RUN_ARGS -server $(SERVER_URL)"; \
-	fi; \
-	if [ ! -z "$(TOKEN)" ]; then \
-		RUN_ARGS="$$RUN_ARGS -token $(TOKEN)"; \
-	fi; \
-	echo "执行: ./$(TARGET) $$RUN_ARGS"; \
-	./$(TARGET) $$RUN_ARGS
+	./bin/xiaozhi
 
-# 激活目标
-.PHONY: activate
-activate: build
-	@echo "执行激活流程..."
-	@RUN_ARGS="-version $(VERSION) -board $(BOARD_TYPE) -activate-only"; \
-	if [ ! -z "$(SERVER_URL)" ]; then \
-		RUN_ARGS="$$RUN_ARGS -server $(SERVER_URL)"; \
-	fi; \
-	if [ ! -z "$(TOKEN)" ]; then \
-		RUN_ARGS="$$RUN_ARGS -token $(TOKEN)"; \
-	fi; \
-	echo "执行: ./$(TARGET) $$RUN_ARGS"; \
-	./$(TARGET) $$RUN_ARGS
+# Build the wake word detection binary
+wake-word:
+	go build -o bin/wake-word cmd/wake-word/main.go
 
-# 清理目标
-.PHONY: clean
-clean:
-	@echo "清理..."
-	$(GO_CLEAN)
-	rm -f $(TARGET)
-	@echo "清理完成"
+# Run the wake word detection
+wake-word-run: wake-word
+	./bin/wake-word
 
-# 下载依赖
-.PHONY: deps
+# Install dependencies
 deps:
-	@echo "下载依赖..."
-	$(GO_MOD) tidy
-	@echo "依赖下载完成"
+	go mod tidy
 
-# 测试目标
-.PHONY: test
-test:
-	@echo "运行测试..."
-	$(GO_TEST) ./...
-	@echo "测试完成" 
+# Clean build artifacts
+clean:
+	rm -f bin/xiaozhi
+	rm -f bin/wake-word
+
+# Download required models (you may need to adjust these URLs)
+models:
+	@echo "Please download the required models manually:"
+	@echo "1. KWS model: https://github.com/k2-fsa/sherpa-onnx/releases/tag/kws-models"
+	@echo "2. VAD model: https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/"
+	@echo "Extract KWS model to: ./sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01/"
+	@echo "Place either silero_vad.onnx or ten-vad.onnx in the root directory"
