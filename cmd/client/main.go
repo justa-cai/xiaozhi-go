@@ -10,6 +10,8 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -47,8 +49,10 @@ var (
 	verboseLogging bool
 	// 添加唤醒词检测标志
 	enableWakeWord bool
-	// 添加VAD标志 (已移除)
-	// enableVAD bool
+	// 添加自动交互模式标志
+	autoInteraction bool
+	// 添加VAD标志
+	enableVAD bool
 	// 添加静音超时时间（毫秒）
 	silenceTimeoutMs int
 )
@@ -63,6 +67,9 @@ var (
 var (
 	wakeWordDetector *wakeword.WakeWordDetector
 	wakeWordTimer    *time.Timer
+	// 全局VAD控制变量，用于自动交互模式
+	vadWakeWordDetected bool = false
+	vadSilenceStartTime  time.Time
 )
 
 // 全局录音控制标志
@@ -96,7 +103,10 @@ func init() {
 	flag.BoolVar(&verboseLogging, "verbose", false, "启用详细日志")
 	// 添加唤醒词检测标志
 	flag.BoolVar(&enableWakeWord, "wakeword", false, "启用唤醒词检测功能")
-	// VAD functionality has been removed
+	// 添加自动交互模式标志
+	flag.BoolVar(&autoInteraction, "auto-interaction", true, "启用自动交互模式（TTS播放结束后自动开始录音）")
+	// 添加VAD标志
+	flag.BoolVar(&enableVAD, "vad", true, "启用高级语音活动检测(VAD)功能，提供更准确的人声检测")
 	// 添加静音超时时间（毫秒）
 	flag.IntVar(&silenceTimeoutMs, "silence-timeout", 800, "静音超时时间（毫秒），超过此时间无语音则自动停止录音")
 
@@ -311,6 +321,20 @@ func main() {
 
 	logrus.Info("正在启动小智客户端...")
 
+	// 显示自动交互模式状态
+	if autoInteraction {
+		logrus.Info("🔄 自动交互模式已启用")
+	} else {
+		logrus.Info("📱 自动交互模式已禁用")
+	}
+
+	// 显示VAD功能状态
+	if enableVAD {
+		logrus.Info("🎙️ 高级VAD语音检测已启用，提供更准确的人声识别和静音检测")
+	} else {
+		logrus.Info("🔊 使用简单能量阈值检测")
+	}
+
 	// 获取设备ID
 	if deviceID == "" {
 		var err error
@@ -467,6 +491,31 @@ func main() {
 								}
 							}
 						}
+
+						// 处理TTS停止消息，触发自动交互模式
+						if msgType == "tts" {
+							if state, exists := typeMap["state"].(string); exists && state == "stop" {
+								logrus.Info("🔄 检测到TTS播放结束，更新客户端状态...")
+
+								// 手动更新客户端状态从speaking到idle
+								currentState := c.GetState()
+								logrus.Infof("📝 TTS停止前客户端状态: %s", currentState)
+								if currentState == client.StateSpeaking {
+									c.SetState(client.StateIdle)
+									logrus.Infof("✅ 已将客户端状态从 %s 更新为 %s", client.StateSpeaking, client.StateIdle)
+								}
+
+								// 如果启用了自动交互模式，触发自动交互
+								if autoInteraction {
+									logrus.Info("🔄 检测到TTS播放结束，自动交互模式启动...")
+									// 异步执行自动交互模式，避免阻塞WebSocket消息处理
+									go func() {
+										time.Sleep(100 * time.Millisecond) // 短暂延迟确保状态更新
+										triggerAutoInteraction(c)
+									}()
+								}
+							}
+						}
 					} else {
 						logrus.Info("📥 接收到JSON数据")
 					}
@@ -515,11 +564,17 @@ func main() {
 	// 显示操作说明
 	if enableWakeWord {
 		fmt.Println("唤醒词检测模式已启用:")
+		if autoInteraction {
+			fmt.Println("  🔄 自动交互模式已启用（TTS播放结束后自动开始录音）")
+		}
 		fmt.Println("  说出 '你好小智' 或 '小智同学' 来激活助手")
 		fmt.Println("  f - 开始录音")
 		fmt.Println("  s - 停止录音")
 		fmt.Println("  q - 退出程序")
 	} else {
+		if autoInteraction {
+			fmt.Println("🔄 自动交互模式已启用（TTS播放结束后自动开始录音）")
+		}
 		fmt.Println("按键操作:")
 		fmt.Println("  f - 开始录音")
 		fmt.Println("  s - 停止录音")
@@ -550,10 +605,6 @@ func main() {
 	if enableWakeWord {
 		logrus.Info("正在初始化唤醒词检测器...")
 		var err error
-		// 添加一个标志来跟踪是否已经检测到唤醒词
-		var wakeWordDetected bool = false
-		// 添加静音开始时间跟踪
-		var silenceStartTime time.Time
 
 		// 最大录音时长10秒
 		const maxRecordingDuration = 10 * time.Second
@@ -574,7 +625,7 @@ func main() {
 				if currentState == client.StateListening {
 					// 如果已经在监听状态，说明是再次唤醒
 					logrus.Info("客户端已在监听状态，检测到唤醒词...")
-					wakeWordDetected = true
+					vadWakeWordDetected = true
 				} else {
 					// 如果不在监听状态，开始监听（等同于按F键）
 					logrus.Info("进入监听模式（等同于按F键）...")
@@ -591,20 +642,25 @@ func main() {
 					logrus.Infof("唤醒词检测回调：开始录音，当前客户端状态: %s", c.GetState())
 					startRecording(c)
 
-					// 设置唤醒词检测标志
-					wakeWordDetected = true
+					// 设置全局VAD标志
+					vadWakeWordDetected = true
 					// 重置静音开始时间
-					silenceStartTime = time.Time{} // 零值，表示还没有静音
+					vadSilenceStartTime = time.Time{} // 零值，表示还没有静音
+
+					// 启动VAD监控goroutine（如果启用高级VAD）
+					if enableVAD {
+						go monitorVADSilence(c)
+					}
 
 					// 设置10秒超时定时器
 					if wakeWordTimer != nil {
 						wakeWordTimer.Stop()
 					}
 					wakeWordTimer = time.AfterFunc(maxRecordingDuration, func() {
-						if wakeWordDetected && c.GetState() == client.StateListening {
+						if vadWakeWordDetected && c.GetState() == client.StateListening {
 							logrus.Info("录音达到最大时长10秒，自动停止录音（等同于按S键）...")
 							stopRecording(c)
-							wakeWordDetected = false
+							vadWakeWordDetected = false
 						}
 					})
 					logrus.Infof("已设置%d秒自动停止定时器", maxRecordingDuration/time.Second)
@@ -612,43 +668,59 @@ func main() {
 			},
 			func() {
 				// End of speech callback - called when silence is detected after wake word
-				logrus.Debug("VAD检测到静音...")
-				logrus.Debugf("静音回调触发时的客户端状态: %s, wakeWordDetected: %v", c.GetState(), wakeWordDetected)
+				// 注意：这个回调主要用作备用，实际的VAD检测现在由集成的VAD系统处理
+				logrus.Debug("唤醒词检测器VAD检测到静音...")
+				logrus.Debugf("唤醒词VAD回调触发时的客户端状态: %s, vadWakeWordDetected: %v", c.GetState(), vadWakeWordDetected)
 
-				// 只有在唤醒词检测成功后才处理静音检测
-				if wakeWordDetected {
+				// 只有在没有启用集成VAD系统时才使用唤醒词检测器的VAD
+				if vadWakeWordDetected && !enableVAD {
 					if c.GetState() == client.StateListening {
 						// 如果是第一次检测到静音，记录静音开始时间
-						if silenceStartTime.IsZero() {
-							silenceStartTime = time.Now()
-							logrus.Infof("🎯 唤醒词模式：开始记录静音时间，静音开始于: %v", silenceStartTime.Format("15:04:05.000"))
+						if vadSilenceStartTime.IsZero() {
+							vadSilenceStartTime = time.Now()
+							logrus.Infof("🎯 唤醒词VAD模式：检测到静音，开始记录静音时间，静音开始于: %v", vadSilenceStartTime.Format("15:04:05.000"))
 							return // 第一次检测到静音时不停止，等待持续静音
 						}
 
 						// 计算持续静音的时间
-						silenceDuration := time.Since(silenceStartTime)
-						logrus.Infof("🎯 唤醒词模式：持续静音时间: %.2f秒", silenceDuration.Seconds())
+						silenceDuration := time.Since(vadSilenceStartTime)
 
-						if silenceDuration >= 3*time.Second {
-							logrus.Info("✅ 连续3秒检测不到声音，自动停止录音（等同于按S键）...")
+						// 根据录音模式设置不同的静音超时时间
+						var silenceThreshold time.Duration
+						var modeDesc string
+
+						// 检查是否是自动交互模式
+						if autoInteraction && c.GetState() == client.StateListening && sendToServer {
+							silenceThreshold = 5 * time.Second
+							modeDesc = "自动交互模式"
+						} else {
+							silenceThreshold = 3 * time.Second
+							modeDesc = "唤醒词模式"
+						}
+
+						// 每秒输出一次静音时长日志，避免刷屏
+						if int(silenceDuration.Seconds()) != int((silenceDuration-time.Second).Seconds()) {
+							logrus.Infof("🎯 %s（唤醒词VAD）：持续静音时间: %.1f秒，阈值: %.1f秒", modeDesc, silenceDuration.Seconds(), float64(silenceThreshold)/float64(time.Second))
+						}
+
+						if silenceDuration >= silenceThreshold {
+							logrus.Infof("✅ 连续%.1f秒检测不到声音，自动停止录音（%s，等同于按S键）...",
+								float64(silenceThreshold)/float64(time.Second), modeDesc)
 							// 停止录音（等同于按S键）
 							stopRecording(c)
 							// 重置标志和定时器
-							wakeWordDetected = false
-							silenceStartTime = time.Time{} // 重置静音时间
+							vadWakeWordDetected = false
+							vadSilenceStartTime = time.Time{} // 重置静音时间
 							if wakeWordTimer != nil {
 								wakeWordTimer.Stop()
 								wakeWordTimer = nil
 							}
-						} else {
-							logrus.Debugf("🎯 唤醒词模式：静音时长: %.2f秒，未达到3秒，继续等待...", silenceDuration.Seconds())
 						}
 					} else {
-						logrus.Debugf("🎯 唤醒词模式：客户端状态为 %s，不处理静音", c.GetState())
+						logrus.Debugf("🎯 唤醒词VAD模式：客户端状态为 %s，不处理静音", c.GetState())
 					}
 				} else {
-					// 非唤醒词模式下的静音检测不处理
-					logrus.Debug("非唤醒词模式下的静音检测，忽略")
+					logrus.Debug("集成VAD已启用，忽略唤醒词检测器的VAD回调")
 				}
 			})
 		if err != nil {
@@ -689,7 +761,7 @@ func main() {
 						// }
 					})
 
-					// Add PCM callback for wake word detection
+					// Add PCM callback for wake word detection and VAD processing
 					audioManager.AddPCMDataCallback("wake_word_detector", func(data []int16, size int) {
 						// logrus.Debugf("PCM音频数据回调被调用，大小: %d", size)
 						// 复制数据以避免竞争条件
@@ -699,6 +771,25 @@ func main() {
 						// 将音频数据传递给唤醒词检测器 (always, even when recording)
 						if wakeWordDetector != nil && wakeWordDetector.IsRunning() {
 							wakeWordDetector.ProcessAudioData(dataCopy)
+						}
+
+						// 使用集成的VAD检测器处理音频数据
+						if audioManager.VAD() != nil {
+							if err := audioManager.ProcessVADAudio(dataCopy); err != nil && debugEnabled {
+								logrus.Debugf("VAD处理音频数据失败: %v", err)
+							}
+						}
+
+						// VAD检测逻辑简化 - 主要的静音监控现在由monitorVADSilence goroutine处理
+						// 这里只做基本的语音检测来重置静音计时器
+						if vadWakeWordDetected && c.GetState() == client.StateListening && enableVAD {
+							if audioManager.VAD() != nil && audioManager.IsVADSpeech() {
+								// 检测到语音，重置静音计时器
+								if !vadSilenceStartTime.IsZero() {
+									logrus.Debugf("🎯 VAD模式：检测到语音活动，重置静音计时器")
+								}
+								vadSilenceStartTime = time.Time{}
+							}
 						}
 					})
 
@@ -741,6 +832,28 @@ func main() {
 					logrus.Debugf("音频数据已接收但未发送到服务器（当前非录音状态），sendToServer: %v, audioChan: %v", sendToServer, audioChan != nil)
 				}
 			})
+
+		// Add PCM callback for VAD in normal mode
+		audioManager.AddPCMDataCallback("vad_normal_mode", func(data []int16, size int) {
+			// 使用集成的VAD检测器处理音频数据
+			if audioManager.VAD() != nil {
+				if err := audioManager.ProcessVADAudio(data); err != nil && debugEnabled {
+					logrus.Debugf("VAD处理音频数据失败: %v", err)
+				}
+			}
+
+			// VAD检测逻辑简化 - 主要的静音监控现在由monitorVADSilence goroutine处理
+			// 这里只做基本的语音检测来重置静音计时器
+			if vadWakeWordDetected && c.GetState() == client.StateListening && enableVAD {
+				if audioManager.VAD() != nil && audioManager.IsVADSpeech() {
+					// 检测到语音，重置静音计时器
+					if !vadSilenceStartTime.IsZero() {
+						logrus.Debugf("🎯 VAD模式：检测到语音活动，重置静音计时器")
+					}
+					vadSilenceStartTime = time.Time{}
+				}
+			}
+		})
 		}
 	}
 
@@ -945,13 +1058,45 @@ func initAudio() {
 
 	logrus.Debug("开始初始化音频系统...")
 
+	// 创建音频管理器选项
+	audioOptions := audio.AudioManagerOptions{
+		SampleRate:        16000,
+		ChannelCount:      1,
+		FrameDuration:     60,
+		UseDefaultDevices: true,
+	}
+
+	// 只有启用VAD时才创建VAD配置
+	var vadConfig *audio.VADConfig
+	if enableVAD {
+		vadConfig = audio.NewVADConfig()
+		vadConfig.Enabled = true
+		vadConfig.Threshold = 0.5
+		vadConfig.MinSilenceDuration = 0.5
+		vadConfig.MinSpeechDuration = 0.25
+		vadConfig.MaxSpeechDuration = 10.0
+		vadConfig.WindowSize = 512
+		vadConfig.SampleRate = 16000
+		vadConfig.SilenceTimeout = time.Duration(silenceTimeoutMs) * time.Millisecond
+		vadConfig.Debug = debugEnabled
+		audioOptions.VADConfig = vadConfig
+		logrus.Info("高级VAD语音检测已启用")
+	} else {
+		logrus.Info("使用简单能量阈值检测，高级VAD功能已禁用")
+	}
+
 	// 始终初始化音频管理器，包括播放功能
 	// 即使启用唤醒词检测，我们仍需要音频管理器来 record user commands after wake word detection
-	audioManager, err = audio.NewAudioManager()
+	audioManager, err = audio.NewAudioManagerWithOptions(audioOptions)
 	if err != nil {
 		logrus.Warnf("初始化音频管理器失败: %v，将无法录音和播放", err)
 	} else {
 		logrus.Debug("音频管理器初始化成功")
+		if enableVAD && audioManager.VAD() != nil {
+			logrus.Info("高级VAD语音检测器已初始化并集成到音频管理器")
+		} else if enableVAD {
+			logrus.Warn("VAD功能已启用但检测器未初始化，将使用简单能量阈值检测")
+		}
 	}
 
 	// audioPlayer 的初始化全部移除，防止oto.NewContext多次调用
@@ -1093,13 +1238,31 @@ func setupCallbacks(c *client.Client) {
 // startRecording 开始录音 (for sending to server after wake word detection)
 func startRecording(c *client.Client) {
 	logrus.Debug("开始录音流程（发送到服务器）")
+
+	// 添加调用来源信息，以便调试
+	pc, file, line, ok := runtime.Caller(1)
+	callerInfo := "unknown"
+	if ok {
+		funcName := runtime.FuncForPC(pc).Name()
+		fileName := filepath.Base(file)
+		callerInfo = fmt.Sprintf("%s:%d (%s)", fileName, line, funcName)
+	}
+	logrus.Infof("🎤 startRecording 调用来源: %s", callerInfo)
+
 	if audioManager == nil {
 		logrus.Error("音频管理器未初始化，无法录音")
 		return
 	}
 
+	currentState := "unknown"
+	if c != nil {
+		currentState = c.GetState()
+	}
+	logrus.Infof("🎤 startRecording: 客户端当前状态: %s, enableWakeWord: %v", currentState, enableWakeWord)
+
 	// 如果客户端不在监听状态，确保先发送开始监听命令
 	if c != nil && c.GetState() != client.StateListening {
+		logrus.Info("🎤 startRecording: 客户端不在监听状态，发送开始监听命令...")
 		if err := c.SendStartListening(client.ListenModeManual); err != nil {
 			logrus.Errorf("发送开始监听命令失败: %v", err)
 			return
@@ -1109,21 +1272,27 @@ func startRecording(c *client.Client) {
 
 	// 检查是否已经在录音状态，避免重复设置
 	if audioChan != nil {
-		logrus.Debug("录音通道已存在，无需重复设置")
+		logrus.Info("🎤 startRecording: 录音通道已存在，激活发送到服务器")
 		// Just ensure we're sending to server
+		oldSendToServer := sendToServer
 		sendToServer = true
+		if oldSendToServer != sendToServer {
+			logrus.Info("🎤 startRecording: 已激活音频数据发送到服务器")
+		}
 		return
 	}
 
-	logrus.Debug("创建新的录音数据通道")
+	logrus.Info("🎤 startRecording: 创建新的录音数据通道")
 	// 创建一个带缓冲的通道来接收音频数据
 	audioChan = make(chan []byte, 100) // 足够大的缓冲区
 
 	// 启动一个单独的goroutine处理音频数据发送
 	go func() {
-		logrus.Debug("音频数据发送goroutine已启动")
+		logrus.Info("🎤 startRecording: 音频数据发送goroutine已启动")
+		packetCount := 0
 		for data := range audioChan {
-			logrus.Debugf("从通道接收到音频数据，准备发送到服务器，大小: %d 字节", len(data))
+			packetCount++
+			logrus.Debugf("从通道接收到音频数据，准备发送到服务器，大小: %d 字节 (包 #%d)", len(data), packetCount)
 
 			// 发送音频数据到服务器
 			startTime := time.Now()
@@ -1133,23 +1302,25 @@ func startRecording(c *client.Client) {
 			if err != nil {
 				logrus.Errorf("发送音频数据失败: %v", err)
 			} else {
-				logrus.Debugf("音频数据已成功发送到服务器，大小: %d 字节，耗时: %v", len(data), elapsed)
+				logrus.Debugf("音频数据已成功发送到服务器，大小: %d 字节，耗时: %v (包 #%d)", len(data), elapsed, packetCount)
 				if elapsed > 100*time.Millisecond {
-					logrus.Warnf("发送音频数据耗时较长: %v，数据大小: %d字节", elapsed, len(data))
+					logrus.Warnf("发送音频数据耗时较长: %v，数据大小: %d字节 (包 #%d)", elapsed, len(data), packetCount)
 				}
 			}
 		}
-		logrus.Debug("音频数据处理已停止")
+		logrus.Infof("🎤 startRecording: 音频数据处理已停止，总共处理了 %d 个数据包", packetCount)
 	}()
 
 	// Enable sending audio data to server
+	oldSendToServer := sendToServer
 	sendToServer = true
-	logrus.Debugf("已设置 sendToServer = true，当前状态: %s", c.GetState())
+	logrus.Infof("🎤 startRecording: 已设置 sendToServer = true (之前: %v)，当前状态: %s", oldSendToServer, c.GetState())
 
 	// In wake word mode, audio manager is already running for wake word detection
 	// We should not call StartRecording again as it's already running
 	// Only start if not in wake word mode and not already recording
 	if !enableWakeWord && !audioManager.IsRecording() {
+		logrus.Info("🎤 startRecording: 启动音频管理器录音...")
 		if err := audioManager.StartRecording(); err != nil {
 			logrus.Errorf("开始录音失败: %v，将无法发送语音", err)
 			// Clean up if we can't start recording
@@ -1163,10 +1334,10 @@ func startRecording(c *client.Client) {
 			logrus.Info("音频管理器录音已启动")
 		}
 	} else {
-		logrus.Debug("音频管理器已在录音中或处于唤醒词检测模式")
+		logrus.Debugf("🎤 startRecording: 音频管理器已在录音中 (%v) 或处于唤醒词检测模式 (%v)", audioManager.IsRecording(), enableWakeWord)
 	}
 
-	logrus.Info("录音数据发送已激活，等待音频输入...")
+	logrus.Info("🎤 startRecording: 录音数据发送已激活，等待音频输入...")
 }
 
 // stopRecording 停止录音并发送停止监听消息到服务器
@@ -1208,6 +1379,11 @@ func stopRecording(c *client.Client) {
 			wakeWordTimer = nil
 			logrus.Debug("已停止唤醒词录音定时器")
 		}
+
+		// 重置VAD标志，准备下一次录音
+		vadWakeWordDetected = false
+		vadSilenceStartTime = time.Time{}
+		logrus.Debug("已重置VAD标志")
 	}
 
 	// 向服务器发送停止监听的消息
@@ -1218,6 +1394,232 @@ func stopRecording(c *client.Client) {
 				logrus.Errorf("发送停止监听消息失败: %v", err)
 			} else {
 				logrus.Info("已向服务器发送停止监听消息")
+			}
+		}
+	}
+}
+
+// triggerAutoInteraction 触发自动交互模式
+func triggerAutoInteraction(c *client.Client) {
+	logrus.Info("🚀 自动交互模式触发开始...")
+
+	// 检查客户端是否已连接到服务器
+	if !c.GetProtocol().IsConnected() {
+		logrus.Warn("自动交互模式：客户端未连接到服务器，跳过自动录音")
+		return
+	}
+	logrus.Info("✅ 客户端连接正常")
+
+	// 检查当前状态
+	currentState := c.GetState()
+	logrus.Infof("🔍 自动交互模式：当前客户端状态: %s", currentState)
+
+	// 如果正在播放AI回复，等待一小段时间看是否会更新状态
+	if currentState == client.StateSpeaking {
+		logrus.Info("⏸️ 自动交互模式：检测到speaking状态，等待状态更新...")
+		// 等待最多1秒看状态是否会自动更新
+		for i := 0; i < 10; i++ {
+			time.Sleep(100 * time.Millisecond)
+			currentState = c.GetState()
+			if currentState != client.StateSpeaking {
+				logrus.Infof("✅ 自动交互模式：状态已更新为: %s", currentState)
+				break
+			}
+		}
+
+		// 如果等待后仍然是speaking状态，手动设置为idle
+		if currentState == client.StateSpeaking {
+			logrus.Info("⚠️ 自动交互模式：状态未自动更新，手动设置为idle")
+			c.SetState(client.StateIdle)
+			currentState = client.StateIdle
+		}
+	}
+
+	// 如果已经在监听状态，无需重复启动
+	if currentState == client.StateListening {
+		logrus.Info("🔄 自动交互模式：已在监听状态，无需重复启动")
+		return
+	}
+
+	// 延迟一小段时间，确保TTS完全播放完毕
+	logrus.Debug("⏳️ 自动交互模式：等待TTS完全播放完毕...")
+	time.Sleep(500 * time.Millisecond)
+
+	// 再次检查状态，确保在延迟期间没有变化
+	currentState = c.GetState()
+	logrus.Infof("🔍 自动交互模式：延迟后客户端状态: %s", currentState)
+	if currentState == client.StateSpeaking {
+		logrus.Info("⏸️ 自动交互模式：状态已变更，AI正在回复，跳过自动录音")
+		return
+	}
+	if currentState == client.StateListening {
+		logrus.Info("🔄 自动交互模式：状态已变更，已在监听状态，无需重复启动")
+		return
+	}
+
+	// 发送开始监听命令到服务器
+	logrus.Info("🎤 自动交互模式：发送开始监听命令到服务器...")
+	if err := c.SendStartListening(client.ListenModeAuto); err != nil {
+		logrus.Errorf("❌ 自动交互模式：发送开始监听命令失败: %v", err)
+		return
+	}
+	logrus.Info("✅ 自动交互模式：开始监听命令发送成功")
+
+	// 等待状态变更
+	logrus.Info("⏳️ 自动交互模式：等待状态变更为监听状态...")
+	stateChangeTimeout := time.After(3 * time.Second)
+	for {
+		currentState = c.GetState()
+		if currentState == client.StateListening {
+			logrus.Info("✅ 自动交互模式：状态已变更为监听状态")
+			break
+		}
+		select {
+		case <-stateChangeTimeout:
+			logrus.Warn("⚠️ 自动交互模式：等待状态变更超时")
+			return
+		case <-time.After(100 * time.Millisecond):
+			// 继续等待
+		}
+	}
+
+	// 开始录音
+	logrus.Info("🎤 自动交互模式：开始录音...")
+	startRecording(c)
+
+	// 验证录音是否已启动
+	if sendToServer && audioChan != nil {
+		logrus.Info("✅ 自动交互模式：录音已启动，音频通道已创建")
+	} else {
+		logrus.Warn("⚠️ 自动交互模式：录音启动验证失败")
+	}
+
+	// 如果启用了唤醒词检测，启用VAD静音检测
+	if enableWakeWord {
+		logrus.Info("🎯 自动交互模式：唤醒词检测已启用，启用VAD静音检测")
+
+		// 启用VAD功能，设置全局标志
+		vadWakeWordDetected = true
+		vadSilenceStartTime = time.Time{} // 重置静音开始时间
+
+		logrus.Info("✅ 自动交互模式：VAD静音检测已启用，5秒静音后自动停止录音")
+
+		// 启动VAD监控goroutine
+		go monitorVADSilence(c)
+
+		// 设置10秒超时定时器作为备用机制
+		const maxRecordingDuration = 10 * time.Second
+		if wakeWordTimer != nil {
+			wakeWordTimer.Stop()
+		}
+		wakeWordTimer = time.AfterFunc(maxRecordingDuration, func() {
+			if vadWakeWordDetected && c.GetState() == client.StateListening {
+				logrus.Info("🎯 自动交互模式：录音达到最大时长10秒，自动停止录音...")
+				stopRecording(c)
+				vadWakeWordDetected = false
+			}
+		})
+		logrus.Infof("🎯 自动交互模式：已设置%d秒超时保护定时器", maxRecordingDuration/time.Second)
+	} else {
+		logrus.Info("🎤 自动交互模式：正常录音模式")
+	}
+}
+
+// monitorVADSilence 监控VAD静音状态
+func monitorVADSilence(c *client.Client) {
+	logrus.Debug("VAD监控goroutine已启动")
+
+	ticker := time.NewTicker(500 * time.Millisecond) // 每500毫秒检查一次
+	defer ticker.Stop()
+
+	lastSilenceSeconds := -1 // 记录上次输出的静音秒数，避免重复输出
+
+	for {
+		select {
+		case <-ticker.C:
+			// 检查VAD是否还在激活状态
+			if !vadWakeWordDetected {
+				logrus.Debug("VAD监控: vadWakeWordDetected为false，退出监控")
+				return
+			}
+
+			// 检查客户端状态
+			if c.GetState() != client.StateListening {
+				continue
+			}
+
+			// 获取VAD静音持续时间
+			var silenceDuration time.Duration
+			var hasSpeech, isSilence bool
+
+			if audioManager != nil && audioManager.VAD() != nil && enableVAD {
+				// 使用集成的VAD检测结果
+				silenceDuration = audioManager.GetVADSilenceDuration()
+				hasSpeech = audioManager.IsVADSpeech()
+				isSilence = audioManager.IsVADSilence()
+			} else {
+				// 使用本地计时
+				if !vadSilenceStartTime.IsZero() {
+					silenceDuration = time.Since(vadSilenceStartTime)
+				}
+				isSilence = true
+			}
+
+			// 如果检测到语音，重置静音计时器
+			if hasSpeech {
+				if !vadSilenceStartTime.IsZero() {
+					logrus.Debugf("🎯 VAD监控：检测到语音活动，重置静音计时器（之前静音了%.1f秒）", silenceDuration.Seconds())
+				}
+				vadSilenceStartTime = time.Time{}
+				lastSilenceSeconds = -1
+				continue
+			}
+
+			// 如果是静音状态，记录静音开始时间
+			if isSilence && vadSilenceStartTime.IsZero() {
+				vadSilenceStartTime = time.Now()
+				logrus.Debugf("🎯 VAD监控：检测到静音，开始记录静音时间，静音开始于: %v", vadSilenceStartTime.Format("15:04:05.000"))
+			}
+
+			// 计算静音持续时间
+			if silenceDuration > 0 {
+				silenceSeconds := int(silenceDuration.Seconds())
+
+				// 根据录音模式设置不同的静音超时时间
+				var silenceThreshold time.Duration
+				var modeDesc string
+
+				// 检查是否是自动交互模式
+				if autoInteraction && c.GetState() == client.StateListening && sendToServer {
+					silenceThreshold = 5 * time.Second
+					modeDesc = "自动交互模式"
+				} else {
+					silenceThreshold = 3 * time.Second
+					modeDesc = "唤醒词模式"
+				}
+
+				// 每秒输出一次静音时长日志，避免刷屏
+				if silenceSeconds != lastSilenceSeconds && silenceSeconds > 0 {
+					logrus.Infof("🎯 %s：持续静音时间: %.1f秒，阈值: %.1f秒", modeDesc, silenceDuration.Seconds(), float64(silenceThreshold)/float64(time.Second))
+					lastSilenceSeconds = silenceSeconds
+				}
+
+				// 检查是否达到静音阈值
+				if silenceDuration >= silenceThreshold {
+					logrus.Infof("✅ 连续%.1f秒检测不到声音，自动停止录音（%s，等同于按S键）...",
+						float64(silenceThreshold)/float64(time.Second), modeDesc)
+
+					// 停止录音（等同于按S键）
+					stopRecording(c)
+
+					// 重置标志
+					vadWakeWordDetected = false
+					vadSilenceStartTime = time.Time{}
+					lastSilenceSeconds = -1
+
+					logrus.Debug("VAD监控: 静音超时，停止录音，退出监控")
+					return
+				}
 			}
 		}
 	}

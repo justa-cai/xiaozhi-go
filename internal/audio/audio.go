@@ -22,6 +22,7 @@ type AudioManagerNew struct {
 	recorder          Recorder        // 新的录音器，改为接口
 	player            *AudioPlayerNew // 新的播放器
 	codec             *OpusCodec      // 编解码器
+	vad               *VADDetector  // VAD语音检测器
 	initialized       bool            // 初始化标志
 	sampleRate        int             // 采样率
 	channelCount      int             // 通道数
@@ -36,6 +37,7 @@ type AudioManagerOptions struct {
 	InputDeviceName   string // 输入设备名称（可选）
 	OutputDeviceName  string // 输出设备名称（可选）
 	UseDefaultDevices bool   // 是否使用默认设备
+	VADConfig         *VADConfig // VAD语音检测配置（可选）
 }
 
 // InitializeAudio 初始化音频系统（Oto无需初始化，直接返回nil）
@@ -104,10 +106,33 @@ func NewAudioManagerWithOptions(options AudioManagerOptions) (*AudioManagerNew, 
 		return nil, fmt.Errorf("创建播放器失败: %v", err)
 	}
 
+	// 创建VAD检测器（如果配置了VAD）
+	var vad *VADDetector
+	if options.VADConfig != nil {
+		vad, err = NewVADDetector(options.VADConfig, nil, nil)
+		if err != nil {
+			recorder.Close()
+			player.Close()
+			codec.Close()
+			TerminateAudio()
+			return nil, fmt.Errorf("创建VAD检测器失败: %v", err)
+		}
+		// 启动VAD检测器
+		if err := vad.Start(); err != nil {
+			recorder.Close()
+			player.Close()
+			codec.Close()
+			vad.Cleanup()
+			TerminateAudio()
+			return nil, fmt.Errorf("启动VAD检测器失败: %v", err)
+		}
+	}
+
 	return &AudioManagerNew{
 		recorder:      recorder,
 		player:        player,
 		codec:         codec,
+		vad:           vad,
 		initialized:   true,
 		sampleRate:    options.SampleRate,
 		channelCount:  options.ChannelCount,
@@ -152,6 +177,14 @@ func (m *AudioManagerNew) Close() error {
 		if err := m.player.Close(); err != nil {
 			logrus.Warnf("关闭播放器失败: %v", err)
 		}
+	}
+
+	// 关闭VAD检测器
+	if m.vad != nil {
+		if err := m.vad.Stop(); err != nil {
+			logrus.Warnf("停止VAD检测器失败: %v", err)
+		}
+		m.vad.Cleanup()
 	}
 
 	// 关闭编解码器
@@ -275,6 +308,57 @@ func (m *AudioManagerNew) FrameDuration() int {
 // Player 返回播放器实例
 func (m *AudioManagerNew) Player() *AudioPlayerNew {
 	return m.player
+}
+
+// VAD 返回VAD检测器实例
+func (m *AudioManagerNew) VAD() *VADDetector {
+	return m.vad
+}
+
+// ProcessVADAudio 处理VAD音频数据
+func (m *AudioManagerNew) ProcessVADAudio(samples []int16) error {
+	if m.vad != nil {
+		return m.vad.ProcessAudioData(samples)
+	}
+	return nil
+}
+
+// SetVADCallbacks 设置VAD回调函数
+func (m *AudioManagerNew) SetVADCallbacks(onSpeech, onSilence func()) {
+	if m.vad != nil {
+		m.vad.SetCallbacks(onSpeech, onSilence)
+	}
+}
+
+// IsVADSpeech 检查当前是否检测到语音
+func (m *AudioManagerNew) IsVADSpeech() bool {
+	if m.vad != nil {
+		return m.vad.IsSpeech()
+	}
+	return false
+}
+
+// IsVADSilence 检查当前是否为静音
+func (m *AudioManagerNew) IsVADSilence() bool {
+	if m.vad != nil {
+		return m.vad.IsSilence()
+	}
+	return false
+}
+
+// GetVADSilenceDuration 获取当前静音持续时间
+func (m *AudioManagerNew) GetVADSilenceDuration() time.Duration {
+	if m.vad != nil {
+		return m.vad.GetSilenceDuration()
+	}
+	return 0
+}
+
+// ResetVAD 重置VAD状态
+func (m *AudioManagerNew) ResetVAD() {
+	if m.vad != nil {
+		m.vad.Reset()
+	}
 }
 
 // RecreatePlayer 根据新参数重建播放器（含 Oto Context）
