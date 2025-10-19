@@ -55,6 +55,8 @@ var (
 	enableVAD bool
 	// 添加静音超时时间（毫秒）
 	silenceTimeoutMs int
+	// 添加自动交互模式静音时间阈值（秒）
+	autoInteractionSilenceThreshold int
 )
 
 // 全局音频管理器
@@ -69,7 +71,7 @@ var (
 	wakeWordTimer    *time.Timer
 	// 全局VAD控制变量，用于自动交互模式
 	vadWakeWordDetected bool = false
-	vadSilenceStartTime  time.Time
+	vadSilenceStartTime time.Time
 )
 
 // 全局录音控制标志
@@ -109,6 +111,8 @@ func init() {
 	flag.BoolVar(&enableVAD, "vad", true, "启用高级语音活动检测(VAD)功能，提供更准确的人声检测")
 	// 添加静音超时时间（毫秒）
 	flag.IntVar(&silenceTimeoutMs, "silence-timeout", 800, "静音超时时间（毫秒），超过此时间无语音则自动停止录音")
+	// 添加自动交互模式静音时间阈值
+	flag.IntVar(&autoInteractionSilenceThreshold, "auto-silence-threshold", 5, "自动交互模式静音时间阈值（秒），超过此时间无语音则自动停止录音")
 
 	// 配置日志
 	logrus.SetFormatter(&logrus.TextFormatter{
@@ -323,7 +327,7 @@ func main() {
 
 	// 显示自动交互模式状态
 	if autoInteraction {
-		logrus.Info("🔄 自动交互模式已启用")
+		logrus.Infof("🔄 自动交互模式已启用，静音阈值：%d秒", autoInteractionSilenceThreshold)
 	} else {
 		logrus.Info("📱 自动交互模式已禁用")
 	}
@@ -565,7 +569,7 @@ func main() {
 	if enableWakeWord {
 		fmt.Println("唤醒词检测模式已启用:")
 		if autoInteraction {
-			fmt.Println("  🔄 自动交互模式已启用（TTS播放结束后自动开始录音）")
+			fmt.Printf("  🔄 自动交互模式已启用（TTS播放结束后自动开始录音，静音阈值：%d秒）\n", autoInteractionSilenceThreshold)
 		}
 		fmt.Println("  说出 '你好小智' 或 '小智同学' 来激活助手")
 		fmt.Println("  f - 开始录音")
@@ -573,7 +577,7 @@ func main() {
 		fmt.Println("  q - 退出程序")
 	} else {
 		if autoInteraction {
-			fmt.Println("🔄 自动交互模式已启用（TTS播放结束后自动开始录音）")
+			fmt.Printf("🔄 自动交互模式已启用（TTS播放结束后自动开始录音，静音阈值：%d秒）\n", autoInteractionSilenceThreshold)
 		}
 		fmt.Println("按键操作:")
 		fmt.Println("  f - 开始录音")
@@ -691,7 +695,7 @@ func main() {
 
 						// 检查是否是自动交互模式
 						if autoInteraction && c.GetState() == client.StateListening && sendToServer {
-							silenceThreshold = 5 * time.Second
+							silenceThreshold = time.Duration(autoInteractionSilenceThreshold) * time.Second
 							modeDesc = "自动交互模式"
 						} else {
 							silenceThreshold = 3 * time.Second
@@ -699,7 +703,7 @@ func main() {
 						}
 
 						// 每秒输出一次静音时长日志，避免刷屏
-						if int(silenceDuration.Seconds()) != int((silenceDuration-time.Second).Seconds()) {
+						if int(silenceDuration.Seconds()) != int((silenceDuration - time.Second).Seconds()) {
 							logrus.Infof("🎯 %s（唤醒词VAD）：持续静音时间: %.1f秒，阈值: %.1f秒", modeDesc, silenceDuration.Seconds(), float64(silenceThreshold)/float64(time.Second))
 						}
 
@@ -833,27 +837,27 @@ func main() {
 				}
 			})
 
-		// Add PCM callback for VAD in normal mode
-		audioManager.AddPCMDataCallback("vad_normal_mode", func(data []int16, size int) {
-			// 使用集成的VAD检测器处理音频数据
-			if audioManager.VAD() != nil {
-				if err := audioManager.ProcessVADAudio(data); err != nil && debugEnabled {
-					logrus.Debugf("VAD处理音频数据失败: %v", err)
-				}
-			}
-
-			// VAD检测逻辑简化 - 主要的静音监控现在由monitorVADSilence goroutine处理
-			// 这里只做基本的语音检测来重置静音计时器
-			if vadWakeWordDetected && c.GetState() == client.StateListening && enableVAD {
-				if audioManager.VAD() != nil && audioManager.IsVADSpeech() {
-					// 检测到语音，重置静音计时器
-					if !vadSilenceStartTime.IsZero() {
-						logrus.Debugf("🎯 VAD模式：检测到语音活动，重置静音计时器")
+			// Add PCM callback for VAD in normal mode
+			audioManager.AddPCMDataCallback("vad_normal_mode", func(data []int16, size int) {
+				// 使用集成的VAD检测器处理音频数据
+				if audioManager.VAD() != nil {
+					if err := audioManager.ProcessVADAudio(data); err != nil && debugEnabled {
+						logrus.Debugf("VAD处理音频数据失败: %v", err)
 					}
-					vadSilenceStartTime = time.Time{}
 				}
-			}
-		})
+
+				// VAD检测逻辑简化 - 主要的静音监控现在由monitorVADSilence goroutine处理
+				// 这里只做基本的语音检测来重置静音计时器
+				if vadWakeWordDetected && c.GetState() == client.StateListening && enableVAD {
+					if audioManager.VAD() != nil && audioManager.IsVADSpeech() {
+						// 检测到语音，重置静音计时器
+						if !vadSilenceStartTime.IsZero() {
+							logrus.Debugf("🎯 VAD模式：检测到语音活动，重置静音计时器")
+						}
+						vadSilenceStartTime = time.Time{}
+					}
+				}
+			})
 		}
 	}
 
@@ -1502,7 +1506,7 @@ func triggerAutoInteraction(c *client.Client) {
 		vadWakeWordDetected = true
 		vadSilenceStartTime = time.Time{} // 重置静音开始时间
 
-		logrus.Info("✅ 自动交互模式：VAD静音检测已启用，5秒静音后自动停止录音")
+		logrus.Infof("✅ 自动交互模式：VAD静音检测已启用，%d秒静音后自动停止录音", autoInteractionSilenceThreshold)
 
 		// 启动VAD监控goroutine
 		go monitorVADSilence(c)
@@ -1591,7 +1595,7 @@ func monitorVADSilence(c *client.Client) {
 
 				// 检查是否是自动交互模式
 				if autoInteraction && c.GetState() == client.StateListening && sendToServer {
-					silenceThreshold = 5 * time.Second
+					silenceThreshold = time.Duration(autoInteractionSilenceThreshold) * time.Second
 					modeDesc = "自动交互模式"
 				} else {
 					silenceThreshold = 3 * time.Second
