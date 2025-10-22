@@ -523,7 +523,9 @@ func (c *Client) SendAudioData(data []byte) error {
 	c.mu.Lock()
 	if c.state != StateListening {
 		c.mu.Unlock()
-		return errors.New("客户端不在监听状态，无法发送音频数据")
+		// 降低日志级别，避免大量错误日志刷屏
+		logrus.Debug("客户端不在监听状态，跳过音频数据发送")
+		return nil // 返回nil而不是error，避免上层不断重试
 	}
 	c.mu.Unlock()
 

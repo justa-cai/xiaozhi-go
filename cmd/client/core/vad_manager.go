@@ -27,6 +27,7 @@ type VADManager struct {
 	isPaused         bool
 	lastResumeTime   time.Time
 	gracePeriod      time.Duration // 宽限期
+	silenceStartTime time.Time     // 静音开始时间
 
 	// 回调
 	onSilenceTimeout func() // 静音超时回调
@@ -72,6 +73,7 @@ func (vm *VADManager) Start() error {
 	defer vm.mu.Unlock()
 
 	if vm.isActive {
+		logrus.Debug("🎯 VAD管理器已经在运行中")
 		return nil
 	}
 
@@ -79,7 +81,9 @@ func (vm *VADManager) Start() error {
 
 	// 重置VAD状态和计时器
 	vm.lastResumeTime = time.Now()
+	vm.silenceStartTime = time.Time{} // 重置静音开始时间
 	vm.isPaused = false
+	logrus.Debugf("🔄 VAD状态已重置：恢复时间=%v, 静音开始时间=%v, 暂停状态=%v", vm.lastResumeTime, vm.silenceStartTime, vm.isPaused)
 
 	// 重置底层VAD检测器状态
 	if vm.audioManager != nil && vm.audioManager.VAD() != nil {
@@ -91,13 +95,16 @@ func (vm *VADManager) Start() error {
 	if vm.audioManager != nil && vm.audioManager.VAD() != nil {
 		// 设置我们的回调函数
 		vm.audioManager.SetVADCallbacks(
-			nil, // 不需要语音开始回调
+			vm.handleSpeechDetection, // 语音开始回调，重置静音计时器
 			vm.handleSilenceDetection,
 		)
 		logrus.Info("✅ 音频管理器VAD回调已设置")
+	} else {
+		logrus.Warn("⚠️ 音频管理器或VAD检测器为空，无法设置回调")
 	}
 
 	vm.isActive = true
+	logrus.Infof("✅ VAD管理器启动成功，静音阈值: %v, 宽限期: %v", vm.silenceThreshold, vm.gracePeriod)
 	return nil
 }
 
@@ -168,10 +175,43 @@ func (vm *VADManager) SetSilenceTimeoutCallback(callback func()) {
 	vm.onSilenceTimeout = callback
 }
 
+// handleSpeechDetection 处理语音检测（重置静音计时器）
+func (vm *VADManager) handleSpeechDetection() {
+	vm.mu.Lock()
+	defer vm.mu.Unlock()
+
+	// 检查VAD管理器是否处于活动状态
+	if !vm.isActive {
+		logrus.Debug("VAD管理器：不在活动状态，跳过语音检测")
+		return
+	}
+
+	// 检查是否在宽限期内
+	if !vm.lastResumeTime.IsZero() && time.Since(vm.lastResumeTime) < vm.gracePeriod {
+		logrus.Debugf("VAD管理器：在宽限期内，跳过语音检测（恢复后%.0fms）", time.Since(vm.lastResumeTime).Milliseconds())
+		return
+	}
+
+	// 重置静音开始时间
+	if !vm.silenceStartTime.IsZero() {
+		silenceDuration := time.Since(vm.silenceStartTime)
+		logrus.Debugf("🔊 VAD管理器：检测到语音，重置静音计时器（之前静音了%.1f秒）", silenceDuration.Seconds())
+		vm.silenceStartTime = time.Time{}
+	} else {
+		logrus.Debug("🔊 VAD管理器：检测到语音，静音计时器已经重置")
+	}
+}
+
 // handleSilenceDetection 处理静音检测
 func (vm *VADManager) handleSilenceDetection() {
-	vm.mu.RLock()
-	defer vm.mu.RUnlock()
+	vm.mu.Lock()
+	defer vm.mu.Unlock()
+
+	// 检查VAD管理器是否处于活动状态
+	if !vm.isActive {
+		logrus.Debug("VAD管理器：不在活动状态，跳过静音检测")
+		return
+	}
 
 	// 检查是否在宽限期内
 	if !vm.lastResumeTime.IsZero() && time.Since(vm.lastResumeTime) < vm.gracePeriod {
@@ -179,27 +219,65 @@ func (vm *VADManager) handleSilenceDetection() {
 		return
 	}
 
-	// 检查是否正在录音
+	// 检查客户端状态
+	if vm.clientInstance == nil {
+		logrus.Warn("VAD管理器：客户端实例为空，无法检测状态")
+		return
+	}
+
+	currentState := vm.clientInstance.GetState()
+	if currentState != client.StateListening {
+		logrus.Debugf("VAD管理器：客户端状态为 %s，不在监听状态，跳过静音检测", currentState)
+		return
+	}
+
+	// 检查录音状态（使用多种方式验证）
+	isRecording := false
 	if vm.recordingController != nil {
-		// 使用类型断言检查录音状态
-		if recorder, ok := vm.recordingController.(interface{ IsRecording() bool }); ok && recorder.IsRecording() {
-			// 检查客户端状态
-			if vm.clientInstance != nil && vm.clientInstance.GetState() == client.StateListening {
-				logrus.Info("🔇 VAD管理器：检测到静音超时，停止录音")
-
-				// 调用外部回调
-				if vm.onSilenceTimeout != nil {
-					vm.onSilenceTimeout()
-				}
-
-				// 停止VAD管理器
-				vm.stopVADManager()
-			} else {
-				logrus.Debug("VAD管理器：客户端不在监听状态，跳过静音检测")
-			}
-		} else {
-			logrus.Debug("VAD管理器：录音已停止，跳过静音检测")
+		// 方法1：使用录音控制器的IsRecording方法
+		if recorder, ok := vm.recordingController.(interface{ IsRecording() bool }); ok {
+			isRecording = recorder.IsRecording()
 		}
+
+		// 方法2：如果方法1返回false但客户端状态是listening，也认为在录音
+		if !isRecording && currentState == client.StateListening {
+			logrus.Debug("VAD管理器：录音控制器显示未录音，但客户端状态为listening，强制启用录音检测")
+			isRecording = true
+		}
+	}
+
+	if !isRecording {
+		logrus.Debug("VAD管理器：录音未在进行中，跳过静音检测")
+		return
+	}
+
+	// 记录静音开始时间（如果还没有开始）
+	if vm.silenceStartTime.IsZero() {
+		vm.silenceStartTime = time.Now()
+		logrus.Debugf("🔇 VAD管理器：开始记录静音时间，开始时间=%v", vm.silenceStartTime)
+		return
+	}
+
+	// 检查是否已经达到静音阈值
+	silenceDuration := time.Since(vm.silenceStartTime)
+	if silenceDuration >= vm.silenceThreshold {
+		logrus.Infof("🔇 VAD管理器：检测到%.1f秒静音超时，开始停止录音", silenceDuration.Seconds())
+
+		// 调用外部回调
+		if vm.onSilenceTimeout != nil {
+			logrus.Debug("VAD管理器：调用静音超时回调")
+			vm.onSilenceTimeout()
+		} else {
+			logrus.Warn("VAD管理器：静音超时回调为空")
+		}
+
+		// 停止VAD管理器
+		vm.stopVADManager()
+	} else {
+		// 还未达到阈值，继续等待
+		logrus.Debugf("🔇 VAD管理器：静音持续%.1f秒，还需%.1f秒达到阈值",
+			silenceDuration.Seconds(),
+			(vm.silenceThreshold - silenceDuration).Seconds())
 	}
 }
 

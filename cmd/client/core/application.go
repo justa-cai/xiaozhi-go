@@ -264,6 +264,12 @@ func (app *Application) setupCallbacks() error {
 	// 设置网络回调处理器
 	callbackHandler := network.NewCallbackHandler(app.clientInstance)
 
+	// 设置VAD管理器到回调处理器，用于处理TTS与VAD状态冲突
+	if app.vadManager != nil {
+		callbackHandler.SetVADManager(app.vadManager)
+		logrus.Debug("✅ VAD管理器已设置到网络回调处理器")
+	}
+
 	// 设置音频处理器
 	callbackHandler.SetAudioHandler(func(data []byte) {
 		app.playbackController.ProcessBinaryAudioData(data, app.flags.VerboseLogging)
@@ -271,9 +277,15 @@ func (app *Application) setupCallbacks() error {
 
 	// 设置TTS开始处理器
 	callbackHandler.SetTTSStartHandler(func() {
-		// 暂停VAD检测，避免在TTS播放期间误触发静音检测（检查是否已暂停，避免重复调用）
-		if app.audioManager != nil && app.audioManager.VAD() != nil && !app.audioManager.VAD().IsPaused() {
-			app.audioManager.PauseVAD()
+		// 优先使用统一的VAD管理器暂停VAD检测
+		if app.vadManager != nil {
+			app.vadManager.Pause()
+			logrus.Debug("🔇 TTS开始：统一VAD管理器已暂停")
+		} else {
+			// 备用方案：使用音频管理器的VAD
+			if app.audioManager != nil && app.audioManager.VAD() != nil && !app.audioManager.VAD().IsPaused() {
+				app.audioManager.PauseVAD()
+			}
 		}
 	})
 

@@ -16,6 +16,7 @@ type CallbackHandler struct {
 	ttsStopHandler  func()          // TTS停止回调
 	helloHandler    func(map[string]interface{}) // Hello消息处理回调
 	sttHandler      func(string)    // STT识别结果回调
+	vadManager      interface{}     // VAD管理器接口，用于处理TTS与VAD状态冲突
 }
 
 // NewCallbackHandler 创建新的回调处理器
@@ -48,6 +49,11 @@ func (ch *CallbackHandler) SetHelloHandler(handler func(map[string]interface{}))
 // SetSTTHandler 设置STT消息处理器
 func (ch *CallbackHandler) SetSTTHandler(handler func(string)) {
 	ch.sttHandler = handler
+}
+
+// SetVADManager 设置VAD管理器
+func (ch *CallbackHandler) SetVADManager(vadManager interface{}) {
+	ch.vadManager = vadManager
 }
 
 // HandleJSONMessage 处理JSON消息
@@ -111,6 +117,32 @@ func (ch *CallbackHandler) handleTTSMessage(typeMap map[string]interface{}) {
 		if state == "start" || state == "sentence_start" {
 			logrus.Info("🎵 检测到TTS播放开始，暂停VAD检测...")
 
+			// 暂停VAD检测，防止TTS音频被误认为用户输入
+			if ch.vadManager != nil {
+				logrus.Debug("🔇 暂停VAD检测器")
+				// 使用类型断言调用VAD管理器的Pause方法
+				if vadManager, ok := ch.vadManager.(interface{ Pause() }); ok {
+					vadManager.Pause()
+				}
+			}
+
+			// 更新客户端状态：listening -> speaking
+			if ch.clientInstance != nil {
+				currentState := ch.clientInstance.GetState()
+				logrus.Infof("📝 TTS开始前客户端状态: %s", currentState)
+
+				if currentState == client.StateListening {
+					ch.clientInstance.SetState(client.StateSpeaking)
+					logrus.Infof("✅ 已将客户端状态从 %s 更新为 %s", client.StateListening, client.StateSpeaking)
+				} else if currentState == client.StateSpeaking {
+					logrus.Debug("客户端已经在speaking状态，无需更新")
+				} else {
+					logrus.Warnf("TTS开始时客户端状态异常: %s，强制设置为speaking", currentState)
+					ch.clientInstance.SetState(client.StateSpeaking)
+					logrus.Info("✅ 强制设置客户端状态为speaking")
+				}
+			}
+
 			// 调用TTS开始回调
 			if ch.ttsStartHandler != nil {
 				ch.ttsStartHandler()
@@ -125,6 +157,15 @@ func (ch *CallbackHandler) handleTTSMessage(typeMap map[string]interface{}) {
 				if currentState == client.StateSpeaking {
 					ch.clientInstance.SetState(client.StateIdle)
 					logrus.Infof("✅ 已将客户端状态从 %s 更新为 %s", client.StateSpeaking, client.StateIdle)
+				}
+			}
+
+			// 恢复VAD检测，为下一次语音输入做准备
+			if ch.vadManager != nil {
+				logrus.Debug("🔊 恢复VAD检测器")
+				// 使用类型断言调用VAD管理器的Resume方法
+				if vadManager, ok := ch.vadManager.(interface{ Resume() }); ok {
+					vadManager.Resume()
 				}
 			}
 

@@ -17,6 +17,7 @@ type WakeWordManager struct {
 	config            WakeWordConfig
 	autoInteractionMode bool
 	soundEffectsManager *audio.SoundEffectsManager
+	onWakeWordDetected func(string) // 唤醒词检测回调
 }
 
 // WakeWordConfig 唤醒词配置
@@ -42,6 +43,9 @@ func (wwm *WakeWordManager) Initialize(
 		return nil
 	}
 
+	// 保存回调函数
+	wwm.onWakeWordDetected = onWakeWordDetected
+
 	logrus.Info("正在初始化唤醒词检测器...")
 
 	var err error
@@ -63,36 +67,68 @@ func (wwm *WakeWordManager) Initialize(
 
 			// 检查当前状态
 			currentState := clientInstance.GetState()
-			if currentState == client.StateListening {
-				// 如果已经在监听状态，说明是再次唤醒
-				logrus.Info("客户端已在监听状态，检测到唤醒词...")
-			} else {
-				// 如果不在监听状态，开始监听（等同于按F键）
-				logrus.Info("进入监听模式（等同于按F键）...")
 
-				// 发送开始录音命令到服务器
-				if err := clientInstance.SendStartListening(client.ListenModeManual); err != nil {
-					logrus.Errorf("发送开始监听命令失败: %v", err)
+			switch currentState {
+			case client.StateListening:
+				// 如果已经在监听状态，重新启动VAD检测
+				logrus.Info("🔄 客户端已在监听状态，检测到唤醒词，重新启动VAD检测...")
+				if wwm.onWakeWordDetected != nil {
+					wwm.onWakeWordDetected(keyword)
+				}
+				return
+
+			case client.StateSpeaking:
+				// 如果正在播放AI回复，先打断播放
+				logrus.Info("🎯 检测到唤醒词，正在中断AI回复...")
+				if err := clientInstance.SendAbortSpeaking("stop_speaking"); err != nil {
+					logrus.Errorf("发送停止讲话命令失败: %v", err)
 					return
 				}
-				logrus.Info("已向服务器发送开始监听命令，准备接收语音输入...")
+				logrus.Info("✅ 已发送停止讲话命令")
 
-				// 调用唤醒词检测回调
-				if onWakeWordDetected != nil {
-					onWakeWordDetected(keyword)
+				// 等待服务器处理完成，并确保状态已重置
+				logrus.Debug("⏳ 等待服务器处理停止讲话命令...")
+				time.Sleep(300 * time.Millisecond)
+
+				// 确保客户端状态已正确重置
+				if clientInstance.GetState() == client.StateSpeaking {
+					logrus.Warn("⚠️ 发送停止命令后状态仍为speaking，强制重置为idle")
+					// 这里可能需要调用状态重置方法，但目前先记录日志
 				}
 
-				// 启动最大录音时长定时器
-				if wwm.timer != nil {
-					wwm.timer.Stop()
-				}
-				wwm.timer = time.AfterFunc(wwm.config.MaxRecordingDuration, func() {
-					if clientInstance.GetState() == client.StateListening {
-						logrus.Info("录音达到最大时长，自动停止录音（等同于按S键）...")
-					}
-				})
-				logrus.Infof("已设置%v自动停止定时器", wwm.config.MaxRecordingDuration)
+			case client.StateIdle:
+				// idle状态，直接开始监听
+				logrus.Info("🎯 idle状态检测到唤醒词，开始监听...")
+
+			default:
+				logrus.Warnf("未知客户端状态: %s，按idle状态处理", currentState)
 			}
+
+			// 统一处理：进入监听模式
+			logrus.Info("🎤 进入监听模式（等同于按F键）...")
+
+			// 发送开始录音命令到服务器
+			if err := clientInstance.SendStartListening(client.ListenModeManual); err != nil {
+				logrus.Errorf("发送开始监听命令失败: %v", err)
+				return
+			}
+			logrus.Info("已向服务器发送开始监听命令，准备接收语音输入...")
+
+			// 调用唤醒词检测回调（用于设置VAD等）
+			if onWakeWordDetected != nil {
+				onWakeWordDetected(keyword)
+			}
+
+			// 启动最大录音时长定时器
+			if wwm.timer != nil {
+				wwm.timer.Stop()
+			}
+			wwm.timer = time.AfterFunc(wwm.config.MaxRecordingDuration, func() {
+				if clientInstance.GetState() == client.StateListening {
+					logrus.Info("录音达到最大时长，自动停止录音（等同于按S键）...")
+				}
+			})
+			logrus.Infof("已设置%v自动停止定时器", wwm.config.MaxRecordingDuration)
 		})
 
 	if err != nil {

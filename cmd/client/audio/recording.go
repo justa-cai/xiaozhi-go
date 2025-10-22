@@ -61,7 +61,20 @@ func (rc *RecordingController) StartRecording(clientInstance *client.Client, ena
 	// 检查是否已经在录音状态，避免重复设置
 	if rc.audioChan != nil {
 		logrus.Info("🎤 StartRecording: 录音通道已存在，激活发送到服务器")
+		// 检查通道是否已关闭，如果是则重新创建
+		select {
+		case _, ok := <-rc.audioChan:
+			if !ok {
+				// 通道已关闭，重新创建
+				logrus.Warn("🎤 检测到录音通道已关闭，重新创建")
+				rc.audioChan = make(chan []byte, 100) // 足够大的缓冲区
+				go rc.handleAudioData(clientInstance)
+			}
+		default:
+			// 通道正常，直接使用
+		}
 		rc.sendToServer = true
+		rc.isRecording = true
 		return nil
 	}
 
@@ -108,20 +121,21 @@ func (rc *RecordingController) StopRecording(clientInstance *client.Client, enab
 		return
 	}
 
-	// 停止向服务器发送音频数据
+	// 先禁用音频数据发送到服务器，防止新的数据被处理
+	rc.sendToServer = false
+	rc.isRecording = false
+	logrus.Debug("已设置 sendToServer = false 和 isRecording = false")
+
+	// 停止向服务器发送音频数据，给更多时间让剩余数据处理完
 	if rc.audioChan != nil {
-		logrus.Debug("关闭录音数据通道")
-		time.Sleep(50 * time.Millisecond)
+		logrus.Debug("关闭录音数据通道，等待剩余数据处理完成")
+		time.Sleep(100 * time.Millisecond) // 增加等待时间
 		close(rc.audioChan)
 		rc.audioChan = nil
+		logrus.Debug("录音数据通道已关闭")
 	} else {
 		logrus.Debug("录音数据通道已为nil，无需关闭")
 	}
-
-	// 禁用音频数据发送到服务器
-	rc.sendToServer = false
-	rc.isRecording = false
-	logrus.Debug("已设置 sendToServer = false")
 
 	// 在非唤醒词模式下停止音频管理器录音
 	if !enableWakeWord {
@@ -155,9 +169,27 @@ func (rc *RecordingController) handleAudioData(clientInstance *client.Client) {
 
 	logrus.Info("🎤 音频数据发送goroutine已启动")
 	packetCount := 0
+	skippedCount := 0
 	for data := range rc.audioChan {
 		packetCount++
-		// logrus.Debugf("从通道接收到音频数据，准备发送到服务器，大小: %d 字节 (包 #%d)", len(data), packetCount)
+
+		// 检查录音状态和客户端状态，避免在状态转换期间发送数据
+		if !rc.sendToServer || !rc.isRecording {
+			skippedCount++
+			if skippedCount <= 5 { // 只记录前5次跳过，避免日志刷屏
+				logrus.Debugf("跳过音频数据发送：sendToServer=%v, isRecording=%v", rc.sendToServer, rc.isRecording)
+			}
+			continue
+		}
+
+		// 检查客户端状态
+		if clientInstance != nil && clientInstance.GetState() != client.StateListening {
+			skippedCount++
+			if skippedCount <= 5 { // 只记录前5次跳过，避免日志刷屏
+				logrus.Debugf("跳过音频数据发送：客户端状态为 %s", clientInstance.GetState())
+			}
+			continue
+		}
 
 		// 发送音频数据到服务器
 		startTime := time.Now()
@@ -165,7 +197,8 @@ func (rc *RecordingController) handleAudioData(clientInstance *client.Client) {
 		elapsed := time.Since(startTime)
 
 		if err != nil {
-			logrus.Errorf("发送音频数据失败: %v", err)
+			// 降低错误日志级别，避免大量错误刷屏
+			logrus.Debugf("发送音频数据失败: %v", err)
 		} else {
 			// logrus.Debugf("音频数据已成功发送到服务器，大小: %d 字节，耗时: %v (包 #%d)", len(data), elapsed, packetCount)
 			if elapsed > 100*time.Millisecond {
@@ -173,12 +206,40 @@ func (rc *RecordingController) handleAudioData(clientInstance *client.Client) {
 			}
 		}
 	}
-	logrus.Infof("🎤 音频数据处理已停止，总共处理了 %d 个数据包", packetCount)
+	if skippedCount > 0 {
+		logrus.Infof("🎤 音频数据处理已停止，总共处理了 %d 个数据包，跳过了 %d 个数据包", packetCount, skippedCount)
+	} else {
+		logrus.Infof("🎤 音频数据处理已停止，总共处理了 %d 个数据包", packetCount)
+	}
 }
 
 // IsRecording 检查是否正在录音
 func (rc *RecordingController) IsRecording() bool {
 	return rc.isRecording
+}
+
+// Cleanup 清理录音控制器资源
+func (rc *RecordingController) Cleanup() {
+	logrus.Info("🧹 清理录音控制器资源")
+
+	// 确保停止录音
+	if rc.isRecording {
+		rc.StopRecording(nil, false)
+	}
+
+	// 清理通道
+	if rc.audioChan != nil {
+		select {
+		case <-rc.audioChan:
+			// 通道中有数据，清空它
+		default:
+			// 通道为空
+		}
+		close(rc.audioChan)
+		rc.audioChan = nil
+	}
+
+	logrus.Info("✅ 录音控制器资源清理完成")
 }
 
 // GetAudioChannel 获取音频通道
