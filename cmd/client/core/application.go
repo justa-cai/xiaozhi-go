@@ -99,9 +99,9 @@ func (app *Application) Initialize() error {
 	// 初始化统一的VAD管理器
 	if app.flags.EnableVAD {
 		vadConfig := VADConfig{
-			SilenceThreshold: time.Duration(app.flags.AutoInteractionSilenceThreshold) * time.Second,
+			SilenceThreshold: 3 * time.Second, // 固定3秒静音超时
 			EnableWakeWord:   app.flags.EnableWakeWord,
-			GracePeriod:      1 * time.Second, // 1秒宽限期
+			GracePeriod:      500 * time.Millisecond, // 0.5秒宽限期
 		}
 		app.vadManager = NewVADManager(
 			app.audioManager,
@@ -109,7 +109,7 @@ func (app *Application) Initialize() error {
 			app.recordingController,
 			vadConfig,
 		)
-		logrus.Info("🎯 统一VAD管理器已初始化")
+		logrus.Info("🎯 统一VAD管理器已初始化，静音超时：3秒")
 	}
 
 	// 初始化网络连接管理器
@@ -378,14 +378,9 @@ func (app *Application) setupWakeWord() error {
 		// 处理唤醒词检测
 		app.wakeWordManager.ProcessAudioData(data)
 
-		// 处理VAD逻辑
-		// If we're in auto interaction mode, handle VAD differently than in normal wake word mode
-		if app.wakeWordManager.IsAutoInteractionMode() {
-			// In auto interaction mode, we handle VAD silence detection separately in monitorVADSilence
-			// Just process the audio for the VAD system
-			if app.audioManager.VAD() != nil {
-				app.audioManager.ProcessVADAudio(data)
-			}
+		// 处理VAD逻辑 - 始终处理VAD音频数据，无论是唤醒词模式还是自动交互模式
+		if app.audioManager.VAD() != nil {
+			app.audioManager.ProcessVADAudio(data)
 		}
 	})
 
@@ -393,6 +388,25 @@ func (app *Application) setupWakeWord() error {
 	err := app.wakeWordManager.Initialize(
 		app.clientInstance,
 		func(keyword string) {
+			logrus.Infof("🎯 唤醒词 '%s' 被检测到，开始录音并启动VAD检测", keyword)
+
+			// 设置VAD静音超时回调
+			if app.vadManager != nil {
+				app.vadManager.SetSilenceTimeoutCallback(func() {
+					logrus.Info("🔇 VAD检测到3秒静音，自动退出listening状态")
+					app.recordingController.StopRecording(app.clientInstance, app.flags.EnableWakeWord)
+					// 强制设置客户端状态为idle，确保状态同步
+					app.clientInstance.SetState(client.StateIdle)
+				})
+
+				// 启动VAD管理器
+				if err := app.vadManager.Start(); err != nil {
+					logrus.Errorf("启动VAD管理器失败: %v", err)
+				} else {
+					logrus.Info("🎯 VAD管理器已启动，开始检测3秒静音超时")
+				}
+			}
+
 			app.recordingController.StartRecording(app.clientInstance, true)
 		},
 	)
@@ -466,13 +480,20 @@ func (app *Application) triggerAutoInteraction() {
 
 	// 关键修复：无论当前状态如何，都要先停止当前录音，然后重新开始
 	// 这确保了录音周期的完整性
-	if app.recordingController.IsRecording() {
-		logrus.Info("🔄 自动交互模式：停止当前录音周期...")
+	// 修复：基于客户端状态判断而不是录音控制器状态
+	if currentState == client.StateListening {
+		logrus.Info("🔄 自动交互模式：检测到listening状态，停止当前录音周期...")
 		app.recordingController.StopRecording(app.clientInstance, app.flags.EnableWakeWord)
-	}
 
-	// 等待一小段时间确保停止完成
-	time.Sleep(200 * time.Millisecond)
+		// 等待一小段时间确保停止完成
+		time.Sleep(200 * time.Millisecond)
+	} else if app.recordingController.IsRecording() {
+		logrus.Info("🔄 自动交互模式：录音控制器显示正在录音，停止当前录音周期...")
+		app.recordingController.StopRecording(app.clientInstance, app.flags.EnableWakeWord)
+
+		// 等待一小段时间确保停止完成
+		time.Sleep(200 * time.Millisecond)
+	}
 
 	// 手动设置客户端状态为idle，这样SendStartListening才能成功
 	logrus.Debug("🔄 自动交互模式：手动设置客户端状态为idle")

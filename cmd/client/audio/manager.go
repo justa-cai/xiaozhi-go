@@ -61,14 +61,10 @@ func (m *Manager) Initialize() error {
 		vadConfig.MaxSpeechDuration = 10.0
 		vadConfig.WindowSize = 512
 		vadConfig.SampleRate = m.config.SampleRate
-		// 在自动交互模式下，禁用VAD的内部超时机制，完全依赖外部回调控制
-		if m.config.AutoInteractionSilenceThreshold > 0 {
-			vadConfig.SilenceTimeout = 0 // 设置为0表示禁用内部超时，只依赖回调
-			logrus.Infof("🔧 自动交互模式：禁用VAD内部超时机制，静音检测由外部回调控制（期望%.1fs）", float64(m.config.AutoInteractionSilenceThreshold))
-		} else {
-			vadConfig.SilenceTimeout = time.Duration(m.config.SilenceTimeoutMs) * time.Millisecond
-			logrus.Infof("VAD静音超时设置为: %dms（默认模式）", m.config.SilenceTimeoutMs)
-		}
+		// 禁用VAD的内部超时机制，完全依赖外部VAD管理器控制
+		// 这样可以统一处理唤醒词模式和自动交互模式的静音检测
+		vadConfig.SilenceTimeout = 0 // 设置为0表示禁用内部超时，只依赖回调
+		logrus.Info("🔧 VAD内部超时机制已禁用，静音检测由外部VAD管理器统一控制")
 		vadConfig.Debug = false // 可以从配置传入
 		audioOptions.VADConfig = vadConfig
 		m.vadConfig = vadConfig

@@ -77,6 +77,16 @@ func (vm *VADManager) Start() error {
 
 	logrus.Info("🎯 启动统一VAD管理器")
 
+	// 重置VAD状态和计时器
+	vm.lastResumeTime = time.Now()
+	vm.isPaused = false
+
+	// 重置底层VAD检测器状态
+	if vm.audioManager != nil && vm.audioManager.VAD() != nil {
+		vm.audioManager.VAD().Reset()
+		logrus.Debug("🔄 VAD检测器状态已重置")
+	}
+
 	// 禁用音频管理器的内部VAD超时机制，完全由我们控制
 	if vm.audioManager != nil && vm.audioManager.VAD() != nil {
 		// 设置我们的回调函数
@@ -182,8 +192,8 @@ func (vm *VADManager) handleSilenceDetection() {
 					vm.onSilenceTimeout()
 				}
 
-				// 重置VAD状态
-				vm.resetVADState()
+				// 停止VAD管理器
+				vm.stopVADManager()
 			} else {
 				logrus.Debug("VAD管理器：客户端不在监听状态，跳过静音检测")
 			}
@@ -193,21 +203,24 @@ func (vm *VADManager) handleSilenceDetection() {
 	}
 }
 
+// stopVADManager 停止VAD管理器
+func (vm *VADManager) stopVADManager() {
+	if !vm.isActive {
+		return
+	}
+
+	logrus.Info("🛑 停止VAD管理器")
+	vm.isActive = false
+
+	// 清除回调
+	vm.onSilenceTimeout = nil
+}
+
 // setupWakeWordGracePeriod 为唤醒词检测器设置宽限期
 func (vm *VADManager) setupWakeWordGracePeriod() {
 	// 唤醒词检测器VAD功能已移除，此函数留空
 }
 
-// resetVADState 重置VAD状态
-func (vm *VADManager) resetVADState() {
-	// 重置音频管理器VAD
-	if vm.audioManager != nil && vm.audioManager.VAD() != nil {
-		vm.audioManager.VAD().Reset()
-		logrus.Debug("🔄 音频管理器VAD状态已重置")
-	}
-
-	// 唤醒词检测器VAD功能已移除
-}
 
 // GetSilenceDuration 获取当前静音持续时间
 func (vm *VADManager) GetSilenceDuration() time.Duration {
