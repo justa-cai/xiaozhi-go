@@ -128,6 +128,17 @@ func NewAudioManagerWithOptions(options AudioManagerOptions) (*AudioManagerNew, 
 		}
 	}
 
+	// 如果VAD存在，添加PCM数据回调来处理录音数据
+	if vad != nil {
+		recorder.AddPCMDataCallback("vad_processor", func(pcmData []int16, size int) {
+			// 将录音数据传递给VAD处理
+			if err := vad.ProcessAudioData(pcmData); err != nil {
+				logrus.Debugf("VAD处理音频数据失败: %v", err)
+			}
+		})
+		logrus.Debug("已添加VAD PCM数据处理回调")
+	}
+
 	return &AudioManagerNew{
 		recorder:      recorder,
 		player:        player,
